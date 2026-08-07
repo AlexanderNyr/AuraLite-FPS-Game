@@ -78,6 +78,10 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
     /** P0-2: token from CONNECT_ACCEPTED, presented to resume this session. */
     @Volatile var resumeToken: Int = 0
 
+    /** P1-4: newest MATCH_EVENT sequence we have processed. Acked back to the
+     *  server in the CLIENT_INPUT header so it stops re-sending old events. */
+    @Volatile var highestEventSeq: Int = -1
+
     // ---- match ------------------------------------------------------------
     @Volatile var mode: GameMode = GameMode.DM
     @Volatile var matchState: Int = MatchState.WARMUP
@@ -285,6 +289,7 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
         localPlayerId = -1
         localTeam = Team.NONE
         resumeToken = 0
+        highestEventSeq = -1
         health = GameConstants.MAX_HEALTH
         alive = false
         kills = 0

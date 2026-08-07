@@ -15,6 +15,8 @@ import com.lanfps.shared.Packets
 import com.lanfps.shared.Protocol
 import com.lanfps.shared.RayMath
 import com.lanfps.shared.Snapshot
+import com.lanfps.shared.SnapshotDelta
+import com.lanfps.shared.SnapshotKind
 import com.lanfps.shared.Team
 import com.lanfps.shared.Vec3
 import java.net.DatagramPacket
@@ -85,6 +87,10 @@ class NetworkClient(
 
     /** Previous per-entity health, for the hit marker heuristic. */
     private val prevHealth = HashMap<Int, Int>()
+
+    /** P1-2: last full snapshot (our delta base) and scratch for reconstruction. */
+    private val baseFull = ArrayList<EntityState>()
+    private val reconstructed = ArrayList<EntityState>()
 
     // ------------------------------------------------------------------ API
 
@@ -384,7 +390,12 @@ class NetworkClient(
             while (recentCommands.size > GameConstants.INPUT_REDUNDANCY) recentCommands.removeAt(0)
 
             try {
-                Protocol.begin(writer, PacketTypes.CLIENT_INPUT, cmd.sequence)
+                // P1-4: the header ack tells the server the newest MATCH_EVENT we
+                // have processed, so it stops re-sending old events.
+                Protocol.begin(
+                    writer, PacketTypes.CLIENT_INPUT, cmd.sequence,
+                    state.highestEventSeq.coerceAtLeast(0),
+                )
                 Packets.writeClientInput(writer, state.localPlayerId, state.pingMs, recentCommands)
                 val len = Protocol.end(writer)
                 sock.send(DatagramPacket(writer.buffer, len, addr, port))
@@ -557,6 +568,7 @@ class NetworkClient(
         state.lastLocalFireMs = now
         state.muzzleFlashUntilMs = now + 45
         state.recoilPitch = MathUtil.clamp(state.recoilPitch + 0.55f, 0f, 3.0f)
+        SoundManager.gunshot() // P1-3: local muzzle report
     }
 
     // ---- inbox draining ----------------------------------------------------
@@ -573,6 +585,24 @@ class NetworkClient(
     }
 
     private fun applySnapshot(snap: Snapshot, now: Long) {
+        // P1-2: a DELTA snapshot carries only changed entities + removed ids.
+        // Rebuild a full state from our last keyframe so interpolation and the
+        // HUD always have the whole world. If we have no base yet (first packet
+        // after connect is always FULL, but guard anyway) wait for the keyframe.
+        if (snap.kind == SnapshotKind.DELTA) {
+            if (baseFull.isEmpty()) return
+            val delta = SnapshotDelta()
+            delta.changed.addAll(snap.deltaChanged)
+            delta.removed.addAll(snap.deltaRemoved)
+            SnapshotDelta.apply(baseFull, delta, reconstructed)
+            snap.entities.clear()
+            snap.entities.addAll(reconstructed)
+            snap.kind = SnapshotKind.FULL
+        } else {
+            baseFull.clear()
+            for (e in snap.entities) baseFull.add(e.copy())
+        }
+
         // P0-1: names no longer arrive in snapshots; join them from the roster
         // so the interpolation buffer, HUD plates and scoreboard see them.
         for (e in snap.entities) {
@@ -611,11 +641,21 @@ class NetworkClient(
             val old = prevHealth[e.id]
             if (old != null && e.health < old && firedRecently && e.health >= 0) {
                 state.hitMarkerUntilMs = now + 140
+                SoundManager.hit() // P1-3: hitmarker sound
             }
             prevHealth[e.id] = e.health
 
             // Remote muzzle flashes / tracers.
-            if (e.firing && e.alive) spawnRemoteTracer(e)
+            if (e.firing && e.alive) {
+                spawnRemoteTracer(e)
+                // P1-3: hear distant shots, quieter the further away.
+                val dist = kotlin.math.sqrt(
+                    (e.x - state.eyeX) * (e.x - state.eyeX) +
+                        (e.z - state.eyeZ) * (e.z - state.eyeZ),
+                )
+                val vol = (1f - dist / 70f).coerceIn(0f, 1f) * 0.5f
+                if (vol > 0.02f) SoundManager.gunshot(vol)
+            }
         }
 
         val me = snap.findEntity(state.localPlayerId) ?: return
@@ -630,6 +670,7 @@ class NetworkClient(
 
         if (me.health < oldHealth && me.alive) {
             state.damageFlashUntilMs = now + 260
+            SoundManager.damage() // P1-3: taking damage
         }
 
         val pred = state.prediction ?: return
@@ -641,6 +682,7 @@ class NetworkClient(
             state.eyeZ = me.z
             if (wasAlive) {
                 state.respawnInSec = GameConstants.RESPAWN_DELAY_SEC
+                SoundManager.death() // P1-3: death sound
                 AndroidLog.d("local player died")
             } else {
                 state.respawnInSec = (state.respawnInSec - 1f / GameConstants.SNAPSHOT_RATE)
@@ -654,6 +696,7 @@ class NetworkClient(
             pred.teleportTo(me)
             input.setAngles(me.yaw, 0f)
             state.respawnInSec = 0f
+            SoundManager.respawn() // P1-3: respawn cue
             AndroidLog.d("local player respawned at (%.1f, %.1f, %.1f)".format(me.x, me.y, me.z))
             return
         }
@@ -682,6 +725,15 @@ class NetworkClient(
     private fun drainEvents() {
         var ev = events.poll()
         while (ev != null) {
+            // P1-4: the server re-sends events until acked; drop duplicates and
+            // stale ones (identified by sequence) before processing.
+            if (state.highestEventSeq >= 0 &&
+                !InputCommand.sequenceGreaterThan(ev.eventSeq, state.highestEventSeq)
+            ) {
+                ev = events.poll()
+                continue
+            }
+            state.highestEventSeq = ev.eventSeq
             when (ev.eventType) {
                 MatchEventType.KILL ->
                     state.addKill(ev.killerName, ev.victimName, ev.killerId, ev.victimId)
@@ -696,6 +748,7 @@ class NetworkClient(
                 MatchEventType.MATCH_END -> {
                     AndroidLog.i("match ended, winner=${ev.extra}")
                     if (state.phase == Phase.PLAYING) state.phase = Phase.ENDED
+                    SoundManager.matchEnd() // P1-3: end-of-match jingle
                     listener.onMatchStateChanged(MatchState.ENDED, ev.extra)
                 }
 

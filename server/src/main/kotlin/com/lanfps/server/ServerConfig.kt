@@ -48,6 +48,14 @@ class ServerConfig {
      *  operators can tune it (and tests can speed it up). Default 8 s. */
     var serverTimeoutMs: Long = GameConstants.SERVER_TIMEOUT_MS
 
+    /** P1-1: rewinds targets on a shot to what the shooter saw (90 ms + RTT/2,
+     *  capped). Can be turned off for direct comparison. */
+    var lagCompensation: Boolean = true
+
+    /** P1-2: send FULL snapshots (keyframes) every second and DELTAs between,
+     *  instead of a full snapshot every 33 ms. */
+    var deltaCompression: Boolean = true
+
     var logLevel: String = "INFO"
 
     /** Headless smoke test: run N seconds of simulation then exit. 0 = normal run. */
@@ -83,6 +91,8 @@ class ServerConfig {
         }
         p.getProperty("zombieTimeoutMs")?.toLongOrNull()?.let { zombieTimeoutMs = it }
         p.getProperty("serverTimeoutMs")?.toLongOrNull()?.let { serverTimeoutMs = it }
+        p.getProperty("lagCompensation")?.let { lagCompensation = it.trim().toBoolean() }
+        p.getProperty("deltaCompression")?.let { deltaCompression = it.trim().toBoolean() }
         p.getProperty("logLevel")?.let { logLevel = it.trim() }
         p.getProperty("selfTestSeconds")?.toIntOrNull()?.let { selfTestSeconds = it }
     }

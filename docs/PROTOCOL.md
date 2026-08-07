@@ -210,9 +210,33 @@ u8     matchState               0 WARMUP, 1 ACTIVE, 2 ENDED
 f32    matchTimeRemaining       seconds
 u16    redScore
 u16    blueScore
+u8     snapshotKind             0 FULL, 1 DELTA
+```
+
+**Delta compression (P1-2).** `snapshotKind` selects the payload:
+
+- **FULL (0)** — the entire world, used as a keyframe (sent every second and on
+  connect). Resets the client's interpolation base.
+
+```
 u8     entityCount
        entityCount x EntityState
 ```
+
+- **DELTA (1)** — only the entities that changed since the recipient's last
+  keyframe, plus removed ids. The client rebuilds a full state from its base.
+
+```
+u8     changedCount
+       changedCount x EntityState   (changed/new entities, full states)
+u8     removedCount
+       removedCount x u16 id        (entities gone since the last keyframe)
+```
+
+Deltas are computed **per recipient** against the last full state it was sent, so
+they are safe even as different clients are on different keyframes. A lost
+datagram only costs until the next keyframe (≤ 1 s). `deltaCompression` in
+`server.properties` turns this off (always FULL).
 
 `EntityState`:
 
@@ -286,6 +310,7 @@ u8     playerCount
 ### 3.10 `MATCH_EVENT` (12)
 
 ```
+u16    eventSeq     monotonically increasing per server (u16 wraps)
 u8     eventType    1 KILL, 2 MATCH_START, 3 MATCH_END, 4 PLAYER_JOINED, 5 PLAYER_LEFT
 u16    killerId
 u16    victimId
@@ -293,6 +318,13 @@ string killerName
 string victimName
 i32    extra        winning team for MATCH_END
 ```
+
+**Reliable delivery (P1-4).** `MATCH_EVENT` is not a fire-and-forget broadcast.
+Each event gets a unique `eventSeq`; the server re-sends every unacknowledged
+event on each snapshot cycle until the client acknowledges it. The client acks
+its **newest processed event sequence** in the **header `ack`** field of every
+`CLIENT_INPUT` (the field that was previously unused there). The client drops
+duplicates by `eventSeq`, so a re-sent event is never applied twice.
 
 ---
 
@@ -361,6 +393,8 @@ The server is the **only** source of truth.
 | Entity interpolation | `client/SnapshotBuffer.kt` | remote players render 90 ms in the past, always between two known states |
 | Input redundancy | `Packets.writeClientInput` | survives packet loss with no retransmits |
 | Snapshot freeze | `SnapshotBuffer.sampleInto` | never extrapolates past the newest snapshot |
+| Lag compensation (P1-1) | `server/World.kt` + `PositionHistory` | hits are tested against where the shooter *saw* targets (~90 ms + RTT/2, capped 250 ms) instead of present positions |
+| Reliable match events (P1-4) | `GameServer` + `ClientSession` | events re-sent until acked in the CLIENT_INPUT header ack |
 
 Prediction and the server run the **same** `MovementSolver` from `:shared` over
 the same fixed timestep. When no packets are lost, replaying the unacknowledged

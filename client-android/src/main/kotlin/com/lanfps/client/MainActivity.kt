@@ -221,6 +221,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         stopUiTicker()
         net?.stopNow()
         net = null
+        SoundManager.release() // P1-3: free the AudioTrack
         super.onDestroy()
     }
 

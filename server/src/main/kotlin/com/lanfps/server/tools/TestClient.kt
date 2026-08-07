@@ -96,6 +96,10 @@ class TestClient(
     private val header = Protocol.Header()
     private val snapshot = Snapshot()
 
+    /** P1-2: last full state, to rebuild full snapshots from DELTAs. */
+    private val baseFull = ArrayList<EntityState>()
+    private val reconstructed = ArrayList<EntityState>()
+
     private val running = AtomicBoolean(true)
 
     @Volatile private var playerId = -1
@@ -326,6 +330,25 @@ class TestClient(
 
     private fun handleSnapshot(r: BinaryReader) {
         Packets.readSnapshot(r, snapshot)
+
+        // P1-2: the server sends DELTA snapshots between FULL keyframes. Rebuild
+        // a full state from our last keyframe so the diagnostics below always see
+        // the whole world, exactly like the Android client does.
+        if (snapshot.kind == com.lanfps.shared.SnapshotKind.DELTA) {
+            val d = com.lanfps.shared.SnapshotDelta()
+            d.changed.addAll(snapshot.deltaChanged)
+            d.removed.addAll(snapshot.deltaRemoved)
+            snapshot.entities.clear()
+            com.lanfps.shared.SnapshotDelta.apply(baseFull, d, reconstructed)
+            snapshot.entities.addAll(reconstructed)
+            snapshot.kind = com.lanfps.shared.SnapshotKind.FULL
+            baseFull.clear()
+            for (e in snapshot.entities) baseFull.add(e.copy())
+        } else {
+            baseFull.clear()
+            for (e in snapshot.entities) baseFull.add(e.copy())
+        }
+
         snapshotsReceived++
         lastSnapshotTimeMs = System.currentTimeMillis()
         lastAckedInput = snapshot.lastProcessedInputSeq

@@ -52,6 +52,10 @@ class GameServer(private val config: ServerConfig) {
     private val inputPacket = Packets.ClientInputPacket()
 
     private var snapshotSequence = 0
+
+    /** P1-4: global monotonically increasing MATCH_EVENT sequence (u16 wraps). */
+    private var matchEventSequence = 0
+
     private var tickCount = 0
     private var ticksThisSecond = 0
     private var rejectedPackets = 0L
@@ -126,6 +130,7 @@ class GameServer(private val config: ServerConfig) {
         var snapshotAccum = 0L
         var lobbyAccum = 0L
         var statsAccum = 0L
+        var pingAccum = 0L
         val selfTestNanos = config.selfTestSeconds * 1_000_000_000L
 
         while (running) {
@@ -140,6 +145,7 @@ class GameServer(private val config: ServerConfig) {
             snapshotAccum += frame
             lobbyAccum += frame
             statsAccum += frame
+            pingAccum += frame
 
             drainInbound()
 
@@ -164,6 +170,12 @@ class GameServer(private val config: ServerConfig) {
                 lobbyAccum = 0
                 broadcastLobbyState()
                 checkTimeouts()
+            }
+
+            // P1-1: server-measured RTT, used for lag compensation.
+            if (pingAccum >= GameConstants.PING_INTERVAL_MS * 1_000_000L) {
+                pingAccum = 0
+                sendServerPings()
             }
 
             if (statsAccum >= STATS_INTERVAL_NANOS) {
@@ -222,6 +234,7 @@ class GameServer(private val config: ServerConfig) {
             PacketTypes.CONNECT_REQUEST -> handleConnect(p, nowMs)
             PacketTypes.CLIENT_INPUT -> handleInput(p, nowMs)
             PacketTypes.PING -> handlePing(p, nowMs)
+            PacketTypes.PONG -> handlePong(p)
             PacketTypes.DISCONNECT -> handleDisconnect(p)
             else -> Log.debug("ignoring ${PacketTypes.name(header.type)} from ${p.address}")
         }
@@ -380,6 +393,10 @@ class GameServer(private val config: ServerConfig) {
         session.touch(nowMs)
         reactivateIfZombie(session)
 
+        // P1-4: the client's ack is the newest MATCH_EVENT sequence it processed;
+        // drop every event up to and including it from the resend queue.
+        session.acknowledgeEvents(header.ack)
+
         Packets.readClientInput(reader, inputPacket)
         if (inputPacket.playerId != session.id) {
             Log.debug("input playerId mismatch from $key, ignoring")
@@ -400,6 +417,40 @@ class GameServer(private val config: ServerConfig) {
         Protocol.begin(writer, PacketTypes.PONG)
         Packets.writePong(writer, clientTime, serverTimeMs())
         socket.send(writer.buffer, Protocol.end(writer), p.address, p.port)
+    }
+
+    /**
+     * P1-1: server side of the RTT measurement. The server sends each session a
+     * PING every second; the client answers with PONG (already implemented in
+     * NetworkClient.rxLoop), and we time the round trip here.
+     */
+    private fun handlePong(p: InboundPacket) {
+        val pong = Packets.Pong()
+        Packets.readPong(reader, pong)
+        val session = sessions[ClientSession.endpointKey(p.address, p.port)] ?: return
+        if (session.lastServerPingSentMs > 0) {
+            val rtt = (System.currentTimeMillis() - session.lastServerPingSentMs).toDouble()
+            if (rtt in 0.0..4000.0) {
+                session.smoothedRttMs = if (session.smoothedRttMs == 0.0) {
+                    rtt
+                } else {
+                    session.smoothedRttMs + (rtt - session.smoothedRttMs) * 0.25
+                }
+            }
+        }
+    }
+
+    /** P1-1: sends a PING to every client so we can measure RTT for lag comp. */
+    private fun sendServerPings() {
+        if (sessions.isEmpty()) return
+        val nowMs = System.currentTimeMillis()
+        for (s in sessions.values) {
+            s.lastServerPingSentMs = nowMs
+            Protocol.begin(writer, PacketTypes.PING)
+            Packets.writePing(writer, serverTimeMs())
+            val len = Protocol.end(writer)
+            socket.send(writer.buffer, len, s.address, s.port)
+        }
     }
 
     private fun handleDisconnect(p: InboundPacket) {
@@ -511,9 +562,12 @@ class GameServer(private val config: ServerConfig) {
     private fun broadcastSnapshot() {
         if (sessions.isEmpty()) return
         snapshotSequence = (snapshotSequence + 1) and 0xFFFF
-        snapshotBuilder.build(world, match, tickCount, serverTimeMs(), snapshotSequence)
         for (session in sessions.values) {
-            snapshotBuilder.patchForClient(session)
+            // P1-2: built per client so each gets FULL keyframes + DELTAs sized
+            // to its own base. lastProcessedInputSeq is stamped inside.
+            snapshotBuilder.buildForClient(
+                world, match, tickCount, serverTimeMs(), snapshotSequence, session,
+            )
             socket.send(
                 snapshotBuilder.buffer, snapshotBuilder.length,
                 session.address, session.port,
@@ -522,22 +576,31 @@ class GameServer(private val config: ServerConfig) {
     }
 
     private fun broadcastMatchEvents() {
-        if (match.pendingEvents.isEmpty() || sessions.isEmpty()) {
+        // Assign a global sequence to each new event and queue it for delivery
+        // to every session. Events are re-sent (below) until the client acks.
+        if (match.pendingEvents.isNotEmpty()) {
+            for (event in match.pendingEvents) {
+                matchEventSequence = (matchEventSequence + 1) and 0xFFFF
+                event.eventSeq = matchEventSequence
+            }
+            if (sessions.isNotEmpty()) {
+                for (event in match.pendingEvents) {
+                    for (session in sessions.values) session.addPendingEvent(event)
+                }
+            }
             match.pendingEvents.clear()
-            return
         }
-        for (event in match.pendingEvents) {
-            Protocol.begin(writer, PacketTypes.MATCH_EVENT)
-            Packets.writeMatchEvent(writer, event)
-            val len = Protocol.end(writer)
-            for (session in sessions.values) {
-                // Sent twice: these are cosmetic (kill feed / banners) and the
-                // authoritative state is repeated in every snapshot anyway.
-                socket.send(writer.buffer, len, session.address, session.port)
+
+        // P1-4: reliably deliver/redeliver every unacknowledged event.
+        if (sessions.isEmpty()) return
+        for (session in sessions.values) {
+            for (event in session.drainPendingEvents()) {
+                Protocol.begin(writer, PacketTypes.MATCH_EVENT)
+                Packets.writeMatchEvent(writer, event)
+                val len = Protocol.end(writer)
                 socket.send(writer.buffer, len, session.address, session.port)
             }
         }
-        match.pendingEvents.clear()
     }
 
     private fun broadcastLobbyState() {
@@ -589,8 +652,10 @@ class GameServer(private val config: ServerConfig) {
         for (session in sessions.values) {
             Log.debug(
                 "  ${session.nickname}: ping=${session.reportedPingMs}ms " +
+                    "serverRtt=${session.smoothedRttMs.toInt()}ms " +
                     "queued=${session.queuedInputs()} applied=${session.commandsApplied} " +
-                    "dropped=${session.commandsDropped}",
+                    "dropped=${session.commandsDropped} " +
+                    "pendingEvents=${session.pendingEventCount}",
             )
         }
     }

@@ -44,6 +44,10 @@ class World(
     @JvmField val raycast: ServerRaycast = ServerRaycast(serverArena.def)
     @JvmField val score: ScoreSystem = ScoreSystem()
 
+    /** P1-1: past entity positions so a shot can be rewound to what the shooter
+     *  actually saw (lag compensation). */
+    @JvmField val history: PositionHistory = PositionHistory()
+
     private val botAI: BotAI = BotAI(this, serverArena, config.botDifficulty)
 
     /** Drained by [GameServer] each tick and sent as MATCH_EVENT packets. */
@@ -189,6 +193,10 @@ class World(
             e.respawnTimer -= dt
             if (e.respawnTimer <= 0f) respawn(e)
         }
+
+        // P1-1: record this tick's positions for lag compensation. Done at the
+        // very end so history always reflects a completed tick.
+        history.record(entities.values)
     }
 
     private fun handleFire(shooter: GameEntity, firePressed: Boolean) {
@@ -199,9 +207,25 @@ class World(
         shooter.fireCooldown = GameConstants.WEAPON_FIRE_INTERVAL
         shooter.firedThisTick = true
 
-        val hit = raycast.fire(shooter, hostilesOf(shooter))
+        val rewindTicks = lagCompRewindTicks(shooter)
+        val rewindPositions =
+            if (rewindTicks > 0) history.positionsAtTicksAgo(rewindTicks) else null
+        val hit = raycast.fire(shooter, hostilesOf(shooter), rewindPositions = rewindPositions)
         val victim = hit.entity ?: return
         applyDamage(victim, shooter, GameConstants.WEAPON_DAMAGE)
+    }
+
+    /**
+     * P1-1: how many simulation ticks back a shot should be tested. Targets are
+     * drawn ~90 ms in the past plus half the shooter's round-trip time, capped at
+     * [GameConstants.MAX_LAG_COMP_MS] so a lagging client gains no advantage.
+     */
+    private fun lagCompRewindTicks(shooter: GameEntity): Int {
+        if (!config.lagCompensation) return 0
+        val rtt = (shooter as? PlayerEntity)?.session?.smoothedRttMs ?: 0.0
+        val rewindMs = GameConstants.INTERPOLATION_DELAY_MS + (rtt * 0.5).toInt()
+        val capped = minOf(rewindMs, GameConstants.MAX_LAG_COMP_MS)
+        return (capped / 1000.0 * GameConstants.TICK_RATE).toInt()
     }
 
     fun applyDamage(victim: GameEntity, attacker: GameEntity, amount: Int) {

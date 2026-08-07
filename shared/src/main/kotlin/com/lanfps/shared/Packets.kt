@@ -178,15 +178,24 @@ object Packets {
     fun writeSnapshot(w: BinaryWriter, s: Snapshot) {
         w.writeI32(s.serverTick)
         w.writeI64(s.serverTimeMs)
-        w.writeU16(s.lastProcessedInputSeq and 0xFFFF) // patched per client
+        w.writeU16(s.lastProcessedInputSeq and 0xFFFF) // set per client
         w.writeU8(s.mode)
         w.writeU8(s.matchState)
         w.writeF32(s.matchTimeRemaining)
         w.writeU16(MathUtil.clamp(s.redScore, 0, 65535))
         w.writeU16(MathUtil.clamp(s.blueScore, 0, 65535))
-        val n = if (s.entities.size > 255) 255 else s.entities.size
-        w.writeU8(n)
-        for (i in 0 until n) s.entities[i].write(w)
+        w.writeU8(s.kind)
+        if (s.kind == SnapshotKind.FULL) {
+            val n = if (s.entities.size > 255) 255 else s.entities.size
+            w.writeU8(n)
+            for (i in 0 until n) s.entities[i].write(w)
+        } else {
+            // P1-2: delta. Reuse a scratch SnapshotDelta for serialisation.
+            val d = SnapshotDelta()
+            d.changed.addAll(s.deltaChanged)
+            d.removed.addAll(s.deltaRemoved)
+            d.write(w)
+        }
     }
 
     fun readSnapshot(r: BinaryReader, out: Snapshot = Snapshot()): Snapshot {
@@ -198,9 +207,21 @@ object Packets {
         out.matchTimeRemaining = r.readF32()
         out.redScore = r.readU16()
         out.blueScore = r.readU16()
-        val n = r.readU8()
-        out.entities.clear()
-        for (i in 0 until n) out.entities.add(EntityState().read(r))
+        out.kind = r.readU8()
+        if (out.kind == SnapshotKind.FULL) {
+            val n = r.readU8()
+            out.entities.clear()
+            out.deltaChanged.clear()
+            out.deltaRemoved.clear()
+            for (i in 0 until n) out.entities.add(EntityState().read(r))
+        } else {
+            val d = SnapshotDelta().read(r)
+            out.entities.clear()
+            out.deltaChanged.clear()
+            out.deltaChanged.addAll(d.changed)
+            out.deltaRemoved.clear()
+            out.deltaRemoved.addAll(d.removed)
+        }
         return out
     }
 
@@ -297,6 +318,10 @@ object Packets {
     // -------------------------------------------------------------- match event
 
     class MatchEvent {
+        /** P1-4: monotonically increasing per-server sequence; clients use it to
+         *  drop duplicates and to acknowledge (via the CLIENT_INPUT header ack)
+         *  so the server stops re-sending. */
+        @JvmField var eventSeq: Int = 0
         @JvmField var eventType: Int = MatchEventType.KILL
         @JvmField var killerId: Int = 0
         @JvmField var victimId: Int = 0
@@ -307,6 +332,7 @@ object Packets {
     }
 
     fun writeMatchEvent(w: BinaryWriter, e: MatchEvent) {
+        w.writeU16(e.eventSeq)
         w.writeU8(e.eventType)
         w.writeU16(e.killerId)
         w.writeU16(e.victimId)
@@ -316,6 +342,7 @@ object Packets {
     }
 
     fun readMatchEvent(r: BinaryReader, out: MatchEvent = MatchEvent()): MatchEvent {
+        out.eventSeq = r.readU16()
         out.eventType = r.readU8()
         out.killerId = r.readU16()
         out.victimId = r.readU16()

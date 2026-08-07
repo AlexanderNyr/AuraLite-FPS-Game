@@ -44,11 +44,16 @@ class ServerRaycast(private val arena: ArenaDef) {
      *
      * @param candidates every entity that could be hit (the caller filters out
      *        the shooter itself and, in TDM, teammates when friendly fire is off).
+     * @param rewindPositions P1-1: optional id -> position map the targets should
+     *        be hit-tested at (as the shooter saw them ~90 ms + RTT/2 ago). When
+     *        null (or missing an entity), that entity is tested at its present
+     *        position.
      */
     fun fire(
         shooter: GameEntity,
         candidates: Collection<GameEntity>,
         range: Float = GameConstants.WEAPON_RANGE,
+        rewindPositions: Map<Int, Vec3>? = null,
     ): Hit {
         result.reset()
 
@@ -63,7 +68,16 @@ class ServerRaycast(private val arena: ArenaDef) {
         var hitEntity: GameEntity? = null
         for (e in candidates) {
             if (e === shooter || !e.alive) continue
-            e.hitbox(box)
+            if (rewindPositions != null) {
+                val p = rewindPositions[e.id]
+                if (p != null) {
+                    box.setFromBody(p, GameConstants.PLAYER_RADIUS, e.body.height)
+                } else {
+                    e.hitbox(box)
+                }
+            } else {
+                e.hitbox(box)
+            }
             val t = RayMath.rayAabb(origin, dir, box, nearest)
             if (t != RayMath.NO_HIT && t < nearest) {
                 nearest = t

@@ -26,7 +26,16 @@ class Snapshot {
     @JvmField var redScore: Int = 0
     @JvmField var blueScore: Int = 0
 
+    /** P1-2: FULL (0) serialises [entities]; DELTA (1) serialises the delta. */
+    @JvmField var kind: Int = SnapshotKind.FULL
+
+    /** Full entity list (FULL snapshots, and the reconstructed result). */
     @JvmField var entities: ArrayList<EntityState> = ArrayList()
+
+    /** P1-2: changed/new entities carried by a DELTA snapshot. */
+    @JvmField var deltaChanged: ArrayList<EntityState> = ArrayList()
+    /** P1-2: ids removed since the recipient's last keyframe. */
+    @JvmField var deltaRemoved: ArrayList<Int> = ArrayList()
 
     val modeEnum: GameMode get() = GameMode.fromWire(mode)
 
@@ -41,7 +50,16 @@ class Snapshot {
         lastProcessedInputSeq = 0
         redScore = 0
         blueScore = 0
+        kind = SnapshotKind.FULL
         entities.clear()
+        deltaChanged.clear()
+        deltaRemoved.clear()
         return this
     }
+}
+
+/** P1-2: snapshot encoding kind, in wire order. */
+object SnapshotKind {
+    const val FULL: Int = 0
+    const val DELTA: Int = 1
 }

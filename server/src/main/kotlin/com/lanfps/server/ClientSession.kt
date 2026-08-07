@@ -2,6 +2,7 @@ package com.lanfps.server
 
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.InputCommand
+import com.lanfps.shared.Packets
 import java.net.InetAddress
 import java.util.ArrayDeque
 
@@ -53,6 +54,16 @@ class ClientSession(
 
     /** P0-2: epoch ms after which a zombie session is finally reclaimed. */
     @JvmField var zombieDeadlineMs: Long = 0L
+
+    // ---- P1-1: server-measured RTT (used by lag compensation) -------------
+    /** When the server last sent a PING to this client (ms), for RTT timing. */
+    @JvmField var lastServerPingSentMs: Long = 0L
+    /** Server-measured round-trip time, EMA-smoothed. */
+    @JvmField var smoothedRttMs: Double = 0.0
+
+    // ---- P1-4: reliable match events -------------------------------------
+    /** Unacknowledged MATCH_EVENTs waiting for this client to ack them. */
+    private val pendingEvents = ArrayDeque<Packets.MatchEvent>()
 
     @JvmField var inputPacketsReceived: Long = 0
     @JvmField var commandsApplied: Long = 0
@@ -147,6 +158,31 @@ class ClientSession(
     fun queuedInputs(): Int = queue.size
 
     fun clearInputs() = queue.clear()
+
+    // ---- P1-4: reliable match events -------------------------------------
+
+    /** Queues a new event for delivery (and re-delivery until acked). */
+    fun addPendingEvent(ev: Packets.MatchEvent) {
+        pendingEvents.addLast(ev)
+        while (pendingEvents.size > GameConstants.MAX_PENDING_MATCH_EVENTS) {
+            pendingEvents.removeFirst()
+        }
+    }
+
+    /** Drops every event the client has acknowledged (its ack is the newest
+     *  event sequence it has processed). Uses 16-bit wraparound comparison. */
+    fun acknowledgeEvents(ackSeq: Int) {
+        while (pendingEvents.isNotEmpty() &&
+            !InputCommand.sequenceGreaterThan(pendingEvents.first().eventSeq, ackSeq)
+        ) {
+            pendingEvents.removeFirst()
+        }
+    }
+
+    /** Snapshot of all currently-unacknowledged events, oldest first. */
+    fun drainPendingEvents(): List<Packets.MatchEvent> = pendingEvents.toList()
+
+    val pendingEventCount: Int get() = pendingEvents.size
 
     override fun toString(): String = "$nickname(#$id @$key)"
 

@@ -229,6 +229,29 @@ class ProtocolTest {
     }
 
     @Test
+    fun `match event round trips its sequence number (P1-4)`() {
+        val ev = Packets.MatchEvent().apply {
+            eventSeq = 42
+            eventType = MatchEventType.KILL
+            killerId = 1
+            victimId = 2
+            killerName = "Alice"
+            victimName = "Bot"
+            extra = 0
+        }
+        val w = BinaryWriter()
+        Protocol.begin(w, PacketTypes.MATCH_EVENT)
+        Packets.writeMatchEvent(w, ev)
+        val len = Protocol.end(w)
+
+        assertEquals(Protocol.ParseResult.OK, Protocol.parse(w.buffer, len, header, reader))
+        val decoded = Packets.readMatchEvent(reader)
+        assertEquals(42, decoded.eventSeq)
+        assertEquals(MatchEventType.KILL, decoded.eventType)
+        assertEquals("Alice", decoded.killerName)
+    }
+
+    @Test
     fun `nickname is truncated to protocol limit`() {
         val w = BinaryWriter()
         val huge = "x".repeat(500)

@@ -52,6 +52,22 @@ class RaycastTest {
     }
 
     @Test
+    fun `lag compensation rewinds a target to where the shooter saw it`() {
+        // P1-1: the shooter aims along the lane (yaw 90, z=-14). The target is
+        // NOW at z=-5 (off axis), but when the shooter saw it it was at z=-14 on
+        // the sight line. Present-position hit-testing would miss; rewinding hits.
+        val shooter = entity(1, -10f, -14f, yaw = 90f)
+        val target = entity(2, 0f, -5f)
+
+        assertNull(raycast.fire(shooter, listOf(target)).entity, "present position misses")
+
+        val rewind = mapOf(target.id to com.lanfps.shared.Vec3(0f, 0f, -14f))
+        val hit = raycast.fire(shooter, listOf(target), rewindPositions = rewind)
+        assertSame(target, hit.entity, "rewound position should land the hit")
+        assertTrue(!hit.hitWorld)
+    }
+
+    @Test
     fun `cannot shoot through the centre pillar`() {
         // Pillar occupies x -2..2, z -2..2 up to y 2.5.
         val shooter = entity(1, -10f, 0f, yaw = 90f)

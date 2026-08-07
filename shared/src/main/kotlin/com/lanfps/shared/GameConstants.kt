@@ -76,6 +76,15 @@ object GameConstants {
      *  redundancy against UDP loss. */
     const val INPUT_REDUNDANCY: Int = 3
 
+    // ---- P1-4: reliable match events -------------------------------------
+    /** Hard cap on unacknowledged MATCH_EVENTs held per session. */
+    const val MAX_PENDING_MATCH_EVENTS: Int = 64
+
+    // ---- P1-1: lag compensation ------------------------------------------
+    /** Upper bound on how far (ms) the server rewinds targets on a shot, so a
+     *  badly lagging client gains no advantage. */
+    const val MAX_LAG_COMP_MS: Int = 250
+
     // ---- Player ------------------------------------------------------------
     const val MAX_HEALTH: Int = 100
     const val PLAYER_RADIUS: Float = 0.35f
