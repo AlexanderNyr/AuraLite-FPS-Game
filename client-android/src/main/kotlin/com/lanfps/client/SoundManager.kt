@@ -2,6 +2,7 @@ package com.lanfps.client
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import kotlin.math.PI
 import kotlin.math.exp
@@ -51,6 +52,7 @@ object SoundManager {
                     .build(),
                 maxOf(minBuf, 8192),
                 AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE,
             ).also {
                 if (it.state == AudioTrack.STATE_INITIALIZED) {
                     track = it
@@ -70,7 +72,7 @@ object SoundManager {
         val t = track() ?: return
         if (volume <= 0.01f) return
         val scaled = ShortArray(samples.size)
-        for (i in samples.indices) scaled[i] = (samples[i].toInt() * volume).toShort()
+        for (i in samples.indices) scaled[i] = (samples[i].toInt() * volume).toInt().toShort()
         try {
             synchronized(lock) {
                 t.write(scaled, 0, scaled.size)
@@ -90,8 +92,8 @@ object SoundManager {
         for (i in 0 until n) {
             val t = i.toFloat() / SAMPLE_RATE
             val env = exp(-decayRate * t)
-            val noise = r.nextFloat() * 2f - 1f
-            out[i] = (noise * amp * env).toInt().toShort()
+            val sample: Int = ((r.nextFloat() * 2f - 1f) * amp * env.toFloat()).toInt()
+            out[i] = sample.toShort()
         }
         return out
     }
@@ -106,7 +108,8 @@ object SoundManager {
             val freq = startHz + (endHz - startHz) * (i.toFloat() / n)
             phase += 2f * PI.toFloat() * freq / SAMPLE_RATE
             val env = exp(-6f * t) // decay envelope
-            out[i] = (sin(phase) * amp * env * 32767f).toInt().toShort()
+            val sample: Int = (sin(phase).toFloat() * amp * env.toFloat() * 32767f).toInt()
+            out[i] = sample.toShort()
         }
         return out
     }
