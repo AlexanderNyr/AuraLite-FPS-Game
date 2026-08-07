@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Server + shared: no Android SDK needed, so this job is the fast gate.
+  # ---------------------------------------------------------------------------
+  server:
+    name: Shared + server (JVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Run the shared + server test suites
+        run: ./gradlew :shared:test :server:test --console=plain --stacktrace
+
+      - name: Build the Windows server bundle
+        run: ./gradlew :server:packageServer --console=plain
+
+      - name: Headless server smoke test
+        # Boots the real jar, runs 15 s of simulation with bots, and exits.
+        # Fails the build if the server cannot start or crashes mid-match.
+        run: |
+          mkdir -p smoke && cd smoke
+          unzip -o -q ../release/server.zip
+          java -jar server.jar --botCount=4 --mode=TDM --selfTestSeconds=15 | tee run.log
+          grep -q "MATCH START" run.log
+          grep -q "server stopped" run.log
+
+      - name: Upload server bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-bundle
+          path: release/server.zip
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-test-reports
+          path: |
+            shared/build/reports/tests/
+            server/build/reports/tests/
+
+  # ---------------------------------------------------------------------------
+  # Android client. Kept separate so a broken SDK never blocks the server gate.
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the build tools this project pins
+        run: sdkmanager --install "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Generate a local signing key
+        # The real key is gitignored on purpose. CI makes a throwaway one so the
+        # release APK is signed and installable straight from the artifact.
+        run: |
+          mkdir -p keystore
+          keytool -genkeypair -v \
+            -keystore keystore/lanfps.keystore \
+            -alias lanfps -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass lanfps -keypass lanfps \
+            -dname "CN=LAN FPS CI, OU=CI, O=LAN FPS, L=CI, S=CI, C=LT"
+
+      - name: Run the client unit tests
+        run: ./gradlew :client-android:testDebugUnitTest --console=plain --stacktrace
+
+      - name: Build the APKs
+        run: ./gradlew :client-android:assembleDebug :client-android:assembleRelease --console=plain
+
+      - name: Verify the release APK is signed
+        run: |
+          APK=$(find client-android/build/outputs/apk/release -name '*.apk' | head -1)
+          "$ANDROID_HOME"/build-tools/34.0.0/apksigner verify --verbose "$APK"
+          "$ANDROID_HOME"/build-tools/34.0.0/aapt2 dump badging "$APK" | head -5
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: client-android/build/outputs/apk/*/*.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-reports
+          path: client-android/build/reports/tests/

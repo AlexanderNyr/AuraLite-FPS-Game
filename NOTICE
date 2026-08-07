@@ -1,0 +1,36 @@
+LAN FPS
+Copyright 2026 LAN FPS contributors
+
+This product is licensed under the Apache License, Version 2.0.
+You may obtain a copy of the License in the LICENSE file distributed with this
+work, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+Third-party content
+--------------------------------------------------------------------------------
+
+This project bundles no third-party source code, libraries, art, audio or fonts.
+
+The runtime dependencies are limited to platform APIs that are not redistributed
+here:
+
+  * The Java Standard Library (java.net, java.util, ...) - provided by the JRE
+    installed on the machine running the server.
+  * The Android framework and OpenGL ES - provided by the device.
+  * The Kotlin standard library - resolved by Gradle at build time and
+    redistributed inside the built artifacts (Apache License 2.0,
+    https://github.com/JetBrains/kotlin).
+
+Build-time tooling (Gradle, the Android Gradle Plugin, the Kotlin Gradle Plugin
+and JUnit) is downloaded by the build and is not part of this source
+distribution. The Gradle wrapper JAR in gradle/wrapper/ is redistributed under
+the Apache License 2.0 (https://github.com/gradle/gradle).
+
+All game content is original to this project:
+
+  * The arena "arena01" is authored as data in arena01.json.
+  * The application icon is an original vector drawable.
+  * There are no texture, model, audio or font assets of any kind - all
+    surfaces are shaded procedurally by GLSL written for this project.

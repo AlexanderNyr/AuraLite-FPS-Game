@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#FF0D1117</color>
+    <color name="panel">#FF161B22</color>
+    <color name="accent">#FFF2A33C</color>
+    <color name="text">#FFE6EDF3</color>
+    <color name="text_dim">#FF8B949E</color>
+    <color name="team_red">#FFE05B4B</color>
+    <color name="team_blue">#FF4B90E0</color>
+    <color name="ic_launcher_bg">#FF11161D</color>
+</resources>

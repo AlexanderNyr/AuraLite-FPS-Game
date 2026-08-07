@@ -1,0 +1,34 @@
+# --- Gradle / build output ---------------------------------------------------
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# --- Android -----------------------------------------------------------------
+local.properties
+*.apk
+*.aab
+
+# Signing keys never belong in a repository. scripts/build-release.sh and CI
+# both generate a throwaway key when this file is missing.
+*.keystore
+*.jks
+
+# --- Packaging output --------------------------------------------------------
+# Release artifacts are attached to a GitHub Release, not committed.
+release/
+dist/
+smoke/
+*.zip
+!/docs/**/*.zip
+
+# --- IDE ---------------------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+
+# --- OS ----------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- Logs --------------------------------------------------------------------
+*.log

@@ -1,0 +1,21 @@
+# Normalise line endings so the repo is identical on Windows and Linux.
+* text=auto eol=lf
+
+# Windows batch files MUST keep CRLF or cmd.exe mis-parses multi-line blocks.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Keep the wrapper executable and LF on every platform.
+gradlew text eol=lf
+
+# Binary: never touch, never diff.
+*.jar    binary
+*.apk    binary
+*.aab    binary
+*.keystore binary
+*.png    binary
+*.zip    binary
+
+# Generated / vendored files should not skew language stats or diffs.
+gradle/wrapper/gradle-wrapper.jar linguist-vendored

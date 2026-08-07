@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Legacy (API 24-25) launcher icon: a plain vector, no PNG assets needed. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#11161D"
+        android:pathData="M8,8h92v92h-92z" />
+    <path
+        android:strokeColor="#F2A33C"
+        android:strokeWidth="4"
+        android:pathData="M54,26 L54,44 M54,64 L54,82 M26,54 L44,54 M64,54 L82,54" />
+    <path
+        android:strokeColor="#F2A33C"
+        android:strokeWidth="3"
+        android:pathData="M54,28 m-26,26 a26,26 0 1,0 52,0 a26,26 0 1,0 -52,0" />
+    <path
+        android:fillColor="#E6EDF3"
+        android:pathData="M54,51 m-3,0 a3,3 0 1,0 6,0 a3,3 0 1,0 -6,0" />
+</vector>
