@@ -33,6 +33,21 @@ class ServerConfig {
     /** 0..1 — scales bot aim accuracy and reaction speed. */
     var botDifficulty: Float = 0.55f
 
+    // ---- P0-3: connection flood protection -------------------------------
+    /** Max simultaneous active sessions per source IP. */
+    var maxSessionsPerIp: Int = GameConstants.MAX_SESSIONS_PER_IP
+    /** Max brand-new sessions accepted per second, globally. */
+    var maxConnectsPerSecond: Int = GameConstants.MAX_CONNECTS_PER_SECOND
+    /** Max brand-new sessions accepted per second from one source IP. */
+    var maxConnectsPerIpPerSecond: Int = GameConstants.MAX_CONNECTS_PER_IP_SECOND
+
+    /** P0-2: how long a silent session stays a zombie awaiting a reconnect. */
+    var zombieTimeoutMs: Long = GameConstants.ZOMBIE_TIMEOUT_MS
+
+    /** How long a session may be silent before it becomes a zombie. Exposed so
+     *  operators can tune it (and tests can speed it up). Default 8 s. */
+    var serverTimeoutMs: Long = GameConstants.SERVER_TIMEOUT_MS
+
     var logLevel: String = "INFO"
 
     /** Headless smoke test: run N seconds of simulation then exit. 0 = normal run. */
@@ -61,6 +76,13 @@ class ServerConfig {
         p.getProperty("arenaFile")?.let { arenaFile = it.trim() }
         p.getProperty("enableDiscovery")?.let { enableDiscovery = it.trim().toBoolean() }
         p.getProperty("botDifficulty")?.toFloatOrNull()?.let { botDifficulty = it }
+        p.getProperty("maxSessionsPerIp")?.toIntOrNull()?.let { maxSessionsPerIp = it }
+        p.getProperty("maxConnectsPerSecond")?.toIntOrNull()?.let { maxConnectsPerSecond = it }
+        p.getProperty("maxConnectsPerIpPerSecond")?.toIntOrNull()?.let {
+            maxConnectsPerIpPerSecond = it
+        }
+        p.getProperty("zombieTimeoutMs")?.toLongOrNull()?.let { zombieTimeoutMs = it }
+        p.getProperty("serverTimeoutMs")?.toLongOrNull()?.let { serverTimeoutMs = it }
         p.getProperty("logLevel")?.let { logLevel = it.trim() }
         p.getProperty("selfTestSeconds")?.toIntOrNull()?.let { selfTestSeconds = it }
     }
@@ -94,6 +116,11 @@ class ServerConfig {
         matchTimeSeconds = matchTimeSeconds.coerceIn(30, 3600)
         killLimit = killLimit.coerceIn(1, 1000)
         botDifficulty = botDifficulty.coerceIn(0f, 1f)
+        maxSessionsPerIp = maxSessionsPerIp.coerceIn(1, 32)
+        maxConnectsPerSecond = maxConnectsPerSecond.coerceIn(1, 1000)
+        maxConnectsPerIpPerSecond = maxConnectsPerIpPerSecond.coerceIn(1, 1000)
+        zombieTimeoutMs = zombieTimeoutMs.coerceIn(5_000L, 300_000L)
+        serverTimeoutMs = serverTimeoutMs.coerceIn(200L, 300_000L)
     }
 
     companion object {

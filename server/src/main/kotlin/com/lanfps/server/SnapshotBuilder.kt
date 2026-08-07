@@ -64,8 +64,13 @@ class SnapshotBuilder {
         length = Protocol.end(writer)
 
         if (length > peakSize) peakSize = length
-        if (length > GameConstants.MAX_PACKET_SIZE) {
-            Log.warn("snapshot is $length bytes, over the ${GameConstants.MAX_PACKET_SIZE} budget")
+        // P0-1: a snapshot over the MTU-safe budget would fragment on Ethernet /
+        // Wi-Fi and a single lost fragment would destroy the whole datagram.
+        // Since names left the snapshot format this is now impossible on a real
+        // population, so make it fail loudly instead of silently fragmenting.
+        require(length <= GameConstants.SNAPSHOT_MAX_BYTES) {
+            "snapshot is $length bytes, over the MTU-safe budget " +
+                "${GameConstants.SNAPSHOT_MAX_BYTES}"
         }
         return length
     }

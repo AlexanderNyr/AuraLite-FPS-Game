@@ -213,12 +213,14 @@ class BotMatchTest {
 
         val builder = SnapshotBuilder()
         val len = builder.build(world, match, 100, 1000L, 1)
+        // P0-1/P0-4: a snapshot must stay under the MTU-safe budget (1400 B),
+        // not just under the 10 KB global datagram cap. Anything above 1472 B
+        // fragments on Ethernet/Wi-Fi and a lost fragment kills the snapshot.
         assertTrue(
-            len < GameConstants.MAX_PACKET_SIZE,
-            "snapshot with 16 entities is $len bytes, over budget",
+            len < GameConstants.SNAPSHOT_MAX_BYTES,
+            "snapshot with 16 entities is $len bytes, over the MTU-safe budget " +
+                "${GameConstants.SNAPSHOT_MAX_BYTES}",
         )
-        // Sanity: should be well under 2 KB for 16 entities.
-        assertTrue(len < 2048, "snapshot unexpectedly large: $len bytes")
         println("snapshot with ${world.entities.size} entities = $len bytes")
     }
 

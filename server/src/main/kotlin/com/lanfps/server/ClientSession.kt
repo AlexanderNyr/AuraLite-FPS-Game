@@ -16,14 +16,15 @@ import java.util.ArrayDeque
  */
 class ClientSession(
     @JvmField val id: Int,
-    @JvmField val address: InetAddress,
-    @JvmField val port: Int,
+    @JvmField var address: InetAddress,
+    @JvmField var port: Int,
     nickname: String,
 ) {
     @JvmField var nickname: String = nickname
 
-    /** Stable key for the address:port -> session map. */
-    val key: String = endpointKey(address, port)
+    /** Key for the address:port -> session map. `var` so a reconnect that comes
+     *  back on a new socket can re-bind the same session under a new key. */
+    var key: String = endpointKey(address, port)
 
     @JvmField var lastPacketTimeMs: Long = System.currentTimeMillis()
     @JvmField var connectedAtMs: Long = System.currentTimeMillis()
@@ -39,6 +40,19 @@ class ClientSession(
 
     /** Outgoing snapshot sequence for this client. */
     @JvmField var snapshotSequence: Int = 0
+
+    /** P0-2: opaque token the client must present to resume this session. */
+    @JvmField var resumeToken: Int = 0
+
+    /** P0-2: true while this session is a reconnectable zombie (silent but kept). */
+    @JvmField var zombie: Boolean = false
+
+    /** Max silence before the session goes zombie. Defaults to
+     *  [GameConstants.SERVER_TIMEOUT_MS]; server config can tune it. */
+    @JvmField var serverTimeoutMs: Long = GameConstants.SERVER_TIMEOUT_MS
+
+    /** P0-2: epoch ms after which a zombie session is finally reclaimed. */
+    @JvmField var zombieDeadlineMs: Long = 0L
 
     @JvmField var inputPacketsReceived: Long = 0
     @JvmField var commandsApplied: Long = 0
@@ -62,7 +76,7 @@ class ClientSession(
     }
 
     fun isTimedOut(nowMs: Long): Boolean =
-        nowMs - lastPacketTimeMs > GameConstants.SERVER_TIMEOUT_MS
+        nowMs - lastPacketTimeMs > serverTimeoutMs
 
     /**
      * Accepts a batch of (possibly redundant) commands, keeping only ones newer

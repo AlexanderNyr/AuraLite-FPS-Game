@@ -55,12 +55,18 @@ object Packets {
         @JvmField var nickname: String = "Player"
         @JvmField var preferredMode: Int = GameMode.DM.wire
         @JvmField var clientTimeMs: Long = 0
+
+        /** P0-2: token handed out in CONNECT_ACCEPTED. A non-zero token on a
+         *  reconnect tells the server to resume the same entity/score/team
+         *  instead of creating a brand-new session. 0 = first connection. */
+        @JvmField var resumeToken: Int = 0
     }
 
     fun writeConnectRequest(w: BinaryWriter, c: ConnectRequest) {
         w.writeString(c.nickname, GameConstants.MAX_NICKNAME_LENGTH * 4)
         w.writeU8(c.preferredMode)
         w.writeI64(c.clientTimeMs)
+        w.writeI32(c.resumeToken)
     }
 
     fun readConnectRequest(r: BinaryReader): ConnectRequest {
@@ -68,6 +74,7 @@ object Packets {
         c.nickname = r.readString()
         c.preferredMode = r.readU8()
         c.clientTimeMs = r.readI64()
+        c.resumeToken = r.readI32()
         return c
     }
 
@@ -82,6 +89,8 @@ object Packets {
         @JvmField var assignedNickname: String = ""
         /** Geometry fingerprint so the client can warn about a mismatched map. */
         @JvmField var arenaHash: Int = 0
+        /** P0-2: the token to present on a future reconnect (0 = not yet). */
+        @JvmField var resumeToken: Int = 0
     }
 
     fun writeConnectAccepted(w: BinaryWriter, a: ConnectAccepted) {
@@ -94,6 +103,7 @@ object Packets {
         w.writeI64(a.serverTimeMs)
         w.writeString(a.assignedNickname, GameConstants.MAX_NICKNAME_LENGTH * 4)
         w.writeI32(a.arenaHash)
+        w.writeI32(a.resumeToken)
     }
 
     fun readConnectAccepted(r: BinaryReader): ConnectAccepted {
@@ -107,6 +117,7 @@ object Packets {
         a.serverTimeMs = r.readI64()
         a.assignedNickname = r.readString()
         a.arenaHash = r.readI32()
+        a.resumeToken = r.readI32()
         return a
     }
 

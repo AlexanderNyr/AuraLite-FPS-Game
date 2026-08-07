@@ -15,6 +15,9 @@ enum class Phase {
     PLAYING,
     ENDED,
     DISCONNECTED,
+
+    /** P0-2: the link dropped but we are retrying with our resume token. */
+    RECONNECTING,
 }
 
 /** One line of the kill feed. */
@@ -71,6 +74,9 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
     @Volatile var localTeam: Team = Team.NONE
     @Volatile var serverName: String = "LAN FPS Server"
     @Volatile var arenaMismatch: Boolean = false
+
+    /** P0-2: token from CONNECT_ACCEPTED, presented to resume this session. */
+    @Volatile var resumeToken: Int = 0
 
     // ---- match ------------------------------------------------------------
     @Volatile var mode: GameMode = GameMode.DM
@@ -236,6 +242,21 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
 
     fun clearDiscovered() = synchronized(discoveryLock) { discovered.clear() }
 
+    // ---- P0-1: name roster ------------------------------------------------
+    // Nicknames no longer travel inside snapshots (they would blow past the MTU
+    // on a full server). They arrive once per LOBBY_STATE, and are joined to
+    // entities by id here so the HUD/scoreboard/end-of-match can still show them.
+    private val rosterLock = Any()
+    private val nameById = HashMap<Int, String>()
+
+    fun setRosterName(id: Int, name: String) = synchronized(rosterLock) {
+        if (name.isNotEmpty()) nameById[id] = name
+    }
+
+    fun rosterName(id: Int): String? = synchronized(rosterLock) { nameById[id] }
+
+    private fun clearRoster() = synchronized(rosterLock) { nameById.clear() }
+
     // ---- scoreboard -------------------------------------------------------
 
     /**
@@ -260,8 +281,10 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
         prediction?.reset()
         clearKillFeed()
         clearTracers()
+        clearRoster()
         localPlayerId = -1
         localTeam = Team.NONE
+        resumeToken = 0
         health = GameConstants.MAX_HEALTH
         alive = false
         kills = 0

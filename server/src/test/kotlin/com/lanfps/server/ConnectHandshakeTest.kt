@@ -2,6 +2,7 @@ package com.lanfps.server
 
 import com.lanfps.shared.BinaryReader
 import com.lanfps.shared.BinaryWriter
+import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.PacketTypes
 import com.lanfps.shared.Packets
@@ -43,7 +44,11 @@ class ConnectHandshakeTest {
         thread?.join(3000)
     }
 
-    private fun startServer(mode: GameMode, bots: Int = 2): GameServer {
+    private fun startServer(
+        mode: GameMode,
+        bots: Int = 2,
+        serverTimeoutMs: Long = GameConstants.SERVER_TIMEOUT_MS,
+    ): GameServer {
         Log.setLevel("ERROR")
         val config = ServerConfig().apply {
             this.mode = mode
@@ -52,6 +57,7 @@ class ConnectHandshakeTest {
             botCount = bots
             maxPlayers = 8
             enableDiscovery = true
+            this.serverTimeoutMs = serverTimeoutMs
         }
         val s = GameServer(config)
         server = s
@@ -198,5 +204,109 @@ class ConnectHandshakeTest {
         assertEquals(com.lanfps.shared.GameConstants.TICK_RATE, accepted.tickRate)
         assertEquals(com.lanfps.shared.GameConstants.SNAPSHOT_RATE, accepted.snapshotRate)
         assertNotNull(accepted.assignedNickname)
+    }
+
+    // ---- P0-2 / P0-3 helpers -----------------------------------------------
+
+    /** Sends one CONNECT_REQUEST and returns ACCEPTED or the reject reason. */
+    private fun attemptConnect(
+        sock: DatagramSocket,
+        nick: String,
+        preferred: GameMode,
+        token: Int,
+    ): Pair<Packets.ConnectAccepted?, String?> {
+        val addr = InetAddress.getByName("127.0.0.1")
+        val w = BinaryWriter(1024)
+        val request = Packets.ConnectRequest().apply {
+            nickname = nick
+            preferredMode = preferred.wire
+            clientTimeMs = System.currentTimeMillis()
+            resumeToken = token
+        }
+        val header = Protocol.Header()
+        val reader = BinaryReader()
+        val buf = ByteArray(4096)
+
+        repeat(20) { attempt ->
+            Protocol.begin(w, PacketTypes.CONNECT_REQUEST, attempt)
+            Packets.writeConnectRequest(w, request)
+            val len = Protocol.end(w)
+            sock.send(DatagramPacket(w.buffer, len, addr, port))
+
+            val deadline = System.currentTimeMillis() + 300
+            while (System.currentTimeMillis() < deadline) {
+                val dp = DatagramPacket(buf, buf.size)
+                try {
+                    sock.receive(dp)
+                } catch (_: Exception) {
+                    break
+                }
+                if (Protocol.parse(dp.data, dp.length, header, reader) != Protocol.ParseResult.OK) continue
+                when (header.type) {
+                    PacketTypes.CONNECT_ACCEPTED -> return Packets.readConnectAccepted(reader) to null
+                    PacketTypes.CONNECT_REJECTED -> return null to Packets.readConnectRejected(reader)
+                }
+            }
+        }
+        return null to null
+    }
+
+    @Test
+    fun `a silent session can reconnect via its resume token and keep its id`() {
+        // P0-2: speed up the server silence timeout so the test finishes fast.
+        startServer(GameMode.DM, bots = 0, serverTimeoutMs = 300)
+
+        val sock1 = DatagramSocket().also { client = it }
+        sock1.soTimeout = 400
+        val (first, rej) = attemptConnect(sock1, "Respawn", GameMode.DM, 0)
+        assertNotNull(first, "first connect rejected: $rej")
+        assertTrue(first!!.resumeToken != 0, "server must hand out a resume token")
+        val id1 = first.playerId
+        val token = first.resumeToken
+
+        // Go silent long enough for the server to mark the session a zombie
+        // (serverTimeoutMs=300 plus the 500 ms timeout-sweep interval).
+        Thread.sleep(1100)
+
+        // Reconnect from a NEW socket, presenting the token.
+        val sock2 = DatagramSocket()
+        sock2.soTimeout = 400
+        try {
+            val (second, rej2) = attemptConnect(sock2, "Respawn", GameMode.DM, token)
+            assertNotNull(second, "reconnect rejected: $rej2")
+            assertEquals(id1, second!!.playerId, "reconnect must keep the same player id")
+            assertEquals(token, second.resumeToken, "server should keep issuing the same token")
+        } finally {
+            sock2.close()
+        }
+        sock1.close()
+    }
+
+    @Test
+    fun `flood of connections from one IP is throttled`() {
+        // P0-3: from a single source IP only maxSessionsPerIp (default 2) active
+        // sessions may exist; a script hammering CONNECT_REQUEST gets rejected.
+        startServer(GameMode.DM, bots = 0)
+
+        val sockets = ArrayList<DatagramSocket>()
+        try {
+            var accepted = 0
+            var rejected = 0
+            repeat(6) { i ->
+                val sock = DatagramSocket()
+                sock.soTimeout = 400
+                sockets.add(sock)
+                val (acc, rej) = attemptConnect(sock, "Flood$i", GameMode.DM, 0)
+                if (acc != null) accepted++ else if (rej != null) rejected++
+            }
+            assertTrue(rejected >= 1, "expected at least one rejected connection")
+            assertTrue(
+                accepted <= GameConstants.MAX_SESSIONS_PER_IP,
+                "per-IP session cap ${GameConstants.MAX_SESSIONS_PER_IP} violated, " +
+                    "accepted=$accepted",
+            )
+        } finally {
+            for (s in sockets) s.close()
+        }
     }
 }

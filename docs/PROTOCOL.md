@@ -17,7 +17,7 @@ Every datagram, in both directions:
 offset  size  field
 ------  ----  ------------------------------------------------------------
   0      4    magic            0x4C414E46  ("LANF")
-  4      1    protocolVersion  currently 1
+  4      1    protocolVersion  currently 2
   5      1    packetType       see §2
   6      2    sequence         u16, wraps; sender-local
   8      2    ack              u16, newest sequence seen from the peer
@@ -27,9 +27,10 @@ offset  size  field
 ```
 
 Header size: **16 bytes**. Maximum datagram: **10240 bytes**
-(`GameConstants.MAX_PACKET_SIZE`); the largest snapshot observed with 8 players
-+ 8 bots is under 400 bytes, so fragmentation never happens on a normal 1500-byte
-MTU.
+(`GameConstants.MAX_PACKET_SIZE`). **Snapshots are additionally capped at
+`GameConstants.SNAPSHOT_MAX_BYTES = 1400`**, under the ~1472-byte unfragmented
+UDP MTU, so a snapshot can never fragment on Ethernet/Wi-Fi (a single lost
+fragment would destroy the whole datagram).
 
 A packet is **silently dropped** — never fatally — when any of these fail:
 
@@ -109,7 +110,14 @@ u16    udpPort
 string nickname         <= 16 characters
 u8     preferredMode    advisory only; the server decides
 i64    clientTimeMs
+i32    resumeToken      0 = new connection, else resume this session
 ```
+
+`resumeToken` is the token the server handed out in `CONNECT_ACCEPTED`. A
+client that dropped out silently can reconnect on a **new socket** and, by
+presenting this token, get back the *same* entity, score and team instead of a
+fresh session (P0-2). A token with no matching live/zombie session is treated as
+a brand-new connection.
 
 `preferredMode` is **ignored**. The ruleset is owned by whoever runs the server
 (`server.properties` / `run-server.bat --mode=TDM`); a connecting client can
@@ -132,12 +140,16 @@ u8     snapshotRate     30
 i64    serverTimeMs
 string assignedNickname may differ (de-duplicated / sanitised)
 i32    arenaHash        FNV-1a fingerprint of the geometry
+i32    resumeToken      opaque token to present on a reconnect (0 = none)
 ```
 
 The client compares `arenaHash` with its own `ArenaDef.hash()`. A mismatch is a
 **warning**, not a disconnect: play continues but the HUD shows
 `! map mismatch with server !`, because differing collision geometry makes
 prediction fight the server near walls.
+
+The client stores `resumeToken` and sends it back in `CONNECT_REQUEST` if the
+link drops, so the server can resume the session (P0-2).
 
 ### 3.5 `CONNECT_REJECTED` (5) / `DISCONNECT` (10)
 
@@ -181,6 +193,12 @@ The server additionally rate-limits to `MAX_INPUTS_PER_SECOND = 90` commands per
 second per session (token bucket), so a modified client cannot buy extra
 movement by spamming input.
 
+**Connection flood protection (P0-3).** New sessions are rate-limited *before*
+any slot or CPU is spent: at most `MAX_CONNECTS_PER_SECOND = 5` brand-new
+connections per second globally and `MAX_CONNECTS_PER_IP_SECOND = 2` per source
+IP, plus a hard cap of `MAX_SESSIONS_PER_IP = 2` simultaneous active sessions
+per source IP. Excess attempts are answered with `CONNECT_REJECTED`.
+
 ### 3.7 `SERVER_SNAPSHOT` (7)
 
 ```
@@ -209,8 +227,13 @@ i16    vx, vy, vz      velocity quantised to 1/100 m/s
 u8     health          0..100
 u16    kills
 u16    deaths
-string name
 ```
+
+**No nickname in snapshots (P0-1).** Sending the name with every entity in every
+30 Hz snapshot could push a full server past the UDP MTU — especially with
+2-byte-per-character names (Cyrillic, CJK) — and IP fragmentation destroys a
+whole snapshot when any fragment is lost. Names travel once per `LOBBY_STATE`
+(§3.9) and the client joins them to entities by `id` via a roster.
 
 Velocity is quantised because it is only used for dead reckoning and debug
 display; three `i16`s save 6 bytes per entity versus three `f32`s, and 1 cm/s is
@@ -297,12 +320,17 @@ Timeouts:
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `CLIENT_TIMEOUT_MS` | 5000 | client gives up on a silent server |
-| `SERVER_TIMEOUT_MS` | 8000 | server drops a silent session |
+| `CLIENT_TIMEOUT_MS` | 5000 | client considers the link silent and starts reconnecting |
+| `RECONNECT_TIMEOUT_MS` | 30000 | client gives up if no accept arrives within this window |
+| `SERVER_TIMEOUT_MS` | 8000 | server marks a silent session a **zombie** (kept for reconnect) |
+| `ZOMBIE_TIMEOUT_MS` | 30000 | server reclaims a zombie session if it never reconnects |
 
-The server's window is longer than the client's on purpose: the client should be
-the one to notice and report first, so the player sees a clear message instead of
-being kicked mid-sentence.
+**Reconnect (P0-2).** When a client goes silent the server does **not** drop it
+immediately. It marks the session a *zombie*: the entity stays in the world
+(standing still, still shootable, score/team preserved) and the slot is held for
+`ZOMBIE_TIMEOUT_MS`. If the client returns within that window presenting its
+`resumeToken` — on the same or a new socket — it is re-bound to the same entity.
+Only when the zombie window expires is the entity removed and the slot freed.
 
 ---
 

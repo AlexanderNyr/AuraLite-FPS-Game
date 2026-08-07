@@ -270,6 +270,11 @@ class NetworkClient(
         state.nickname = acc.assignedNickname.ifEmpty { state.nickname }
         state.lastServerContactMs = System.currentTimeMillis()
 
+        // P0-2: remember the resume token; P0-1: register our own name in the
+        // roster (names no longer travel inside snapshots).
+        state.resumeToken = acc.resumeToken
+        state.setRosterName(acc.playerId, state.nickname)
+
         val localHash = arena.hash()
         state.arenaMismatch = acc.arenaHash != 0 && acc.arenaHash != localHash
         if (state.arenaMismatch) {
@@ -336,17 +341,14 @@ class NetworkClient(
             drainSnapshots(now)
             drainEvents()
 
-            // Server silence detection.
+            // Server silence detection. P0-2: instead of bailing to the menu we
+            // enter a reconnect loop that presents our resume token. Only if that
+            // exhausts its window do we actually give up.
             if (state.lastServerContactMs > 0 &&
                 now - state.lastServerContactMs > GameConstants.CLIENT_TIMEOUT_MS
             ) {
-                val msg = "Lost connection to the server (no packets for " +
-                    "${GameConstants.CLIENT_TIMEOUT_MS / 1000} s)."
-                AndroidLog.w(msg)
-                state.errorText = msg
-                state.phase = Phase.DISCONNECTED
-                listener.onDisconnected(msg, true)
-                return
+                if (!attemptReconnect(sock, addr, port, writer, now)) return
+                continue
             }
 
             val pred = state.prediction
@@ -410,6 +412,93 @@ class NetworkClient(
                 lastSnapCount = c
                 lastSnapCountAt = now
             }
+        }
+    }
+
+    /**
+     * P0-2: blocks in a short reconnect loop until the server re-accepts us with
+     * our resume token (same id/score/team), or the window elapses.
+     * @return true if reconnected, false if the caller should give up.
+     */
+    private fun attemptReconnect(
+        sock: DatagramSocket,
+        addr: InetAddress,
+        port: Int,
+        writer: BinaryWriter,
+        nowMs: Long,
+    ): Boolean {
+        val phaseBefore = state.phase
+        state.phase = Phase.RECONNECTING
+        val msg = "Connection lost — reconnecting…"
+        AndroidLog.w(msg)
+        state.statusText = msg
+        listener.onDisconnected(msg, false)
+
+        // Clear the stale handshake result so we only react to a fresh
+        // CONNECT_ACCEPTED from the server while reconnecting.
+        accepted = null
+
+        val deadline = nowMs + GameConstants.RECONNECT_TIMEOUT_MS
+        var lastSend = 0L
+        while (running.get() && !wantDisconnect.get()) {
+            val now = System.currentTimeMillis()
+            if (now >= deadline) {
+                val fail = "Could not reconnect to the server."
+                AndroidLog.w(fail)
+                state.errorText = fail
+                state.phase = Phase.DISCONNECTED
+                listener.onDisconnected(fail, true)
+                return false
+            }
+
+            drainSnapshots(now)
+            drainEvents()
+
+            val acc = accepted
+            if (acc != null) {
+                accepted = null
+                onAccepted(acc)
+                // Resume where we were (PLAYING/LOBBY) rather than dumping the
+                // player back into a fresh handshake.
+                state.phase = phaseBefore
+                state.lastServerContactMs = now
+                return true
+            }
+
+            if (now - lastSend >= 1000) {
+                lastSend = now
+                sendReconnectRequest(sock, addr, port, writer)
+            }
+            try {
+                Thread.sleep(50)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+        return false
+    }
+
+    /** P0-2: resends CONNECT_REQUEST carrying our resume token. */
+    private fun sendReconnectRequest(
+        sock: DatagramSocket,
+        addr: InetAddress,
+        port: Int,
+        writer: BinaryWriter,
+    ) {
+        val req = Packets.ConnectRequest().apply {
+            nickname = state.nickname
+            preferredMode = GameMode.DM.wire
+            clientTimeMs = System.currentTimeMillis()
+            resumeToken = state.resumeToken
+        }
+        try {
+            Protocol.begin(writer, PacketTypes.CONNECT_REQUEST)
+            Packets.writeConnectRequest(writer, req)
+            val len = Protocol.end(writer)
+            sock.send(DatagramPacket(writer.buffer, len, addr, port))
+            state.packetsOut++
+        } catch (e: Exception) {
+            AndroidLog.d("reconnect request send failed: ${e.message}")
         }
     }
 
@@ -484,6 +573,15 @@ class NetworkClient(
     }
 
     private fun applySnapshot(snap: Snapshot, now: Long) {
+        // P0-1: names no longer arrive in snapshots; join them from the roster
+        // so the interpolation buffer, HUD plates and scoreboard see them.
+        for (e in snap.entities) {
+            e.name = if (e.id == state.localPlayerId) {
+                state.nickname
+            } else {
+                state.rosterName(e.id) ?: ""
+            }
+        }
         state.snapshots.add(snap, now)
 
         state.mode = GameMode.fromWire(snap.mode)
@@ -656,7 +754,9 @@ class NetworkClient(
                     }
 
                     PacketTypes.CONNECT_ACCEPTED ->
-                        if (accepted == null) accepted = Packets.readConnectAccepted(reader)
+                        // Always store: the tx thread nulls it after consuming, so
+                        // this also feeds the P0-2 reconnect flow.
+                        accepted = Packets.readConnectAccepted(reader)
 
                     PacketTypes.CONNECT_REJECTED ->
                         rejectedReason = Packets.readConnectRejected(reader)
@@ -697,6 +797,8 @@ class NetworkClient(
                         val lobby = Packets.readLobbyState(reader)
                         state.serverName = lobby.serverName
                         state.mode = GameMode.fromWire(lobby.mode)
+                        // P0-1: LOBBY_STATE is now the ONLY place names arrive.
+                        for (p in lobby.players) state.setRosterName(p.id, p.name)
                     }
 
                     else -> AndroidLog.d("ignored packet type ${header.type}")

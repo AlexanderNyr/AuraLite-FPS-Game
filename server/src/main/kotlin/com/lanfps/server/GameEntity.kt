@@ -90,7 +90,7 @@ abstract class GameEntity(@JvmField val id: Int) {
         dst.alive = alive
         dst.firing = firedThisTick
         dst.crouching = body.crouching
-        dst.name = name
+        // P0-1: names no longer go into snapshots (they move via LOBBY_STATE).
     }
 
     override fun toString(): String = "#$id '$name'"

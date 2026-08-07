@@ -10,7 +10,10 @@ object GameConstants {
     // ---- Protocol ----------------------------------------------------------
     /** ASCII "LANF" — first 4 bytes of every packet. */
     const val MAGIC: Int = 0x4C414E46
-    const val PROTOCOL_VERSION: Int = 1
+
+    /** Bumped to 2 when nicknames were removed from snapshots and the
+     *  CONNECT_REQUEST / CONNECT_ACCEPTED layouts gained a resume token. */
+    const val PROTOCOL_VERSION: Int = 2
 
     const val DEFAULT_UDP_PORT: Int = 7777
     const val DEFAULT_TCP_PORT: Int = 7778
@@ -18,6 +21,13 @@ object GameConstants {
 
     /** Hard cap for a single datagram we are willing to build or accept. */
     const val MAX_PACKET_SIZE: Int = 10 * 1024
+
+    /**
+     * P0-1: an Ethernet/Wi-Fi UDP datagram fragments beyond ~1472 bytes
+     * (1500 MTU - 20 IP - 8 UDP), and a single lost fragment destroys the whole
+     * snapshot. Every snapshot must stay under this MTU-safe budget.
+     */
+    const val SNAPSHOT_MAX_BYTES: Int = 1400
 
     // ---- Timing ------------------------------------------------------------
     /** Authoritative simulation rate. */
@@ -35,8 +45,16 @@ object GameConstants {
 
     /** Client stops hearing from server for this long -> assume disconnected. */
     const val CLIENT_TIMEOUT_MS: Long = 5_000
-    /** Server stops hearing from a client for this long -> drop the session. */
+    /** Server stops hearing from a client for this long -> mark the session a
+     *  zombie (kept for reconnect) rather than dropping it. */
     const val SERVER_TIMEOUT_MS: Long = 8_000
+
+    /** P0-2: how long a silent session is kept as a zombie for a reconnect with
+     *  its resume token before the entity and slot are finally reclaimed. */
+    const val ZOMBIE_TIMEOUT_MS: Long = 30_000
+
+    /** P0-2: how long the client keeps trying to reconnect before giving up. */
+    const val RECONNECT_TIMEOUT_MS: Long = 30_000
 
     /** Client sends a ping this often. */
     const val PING_INTERVAL_MS: Long = 1_000
@@ -44,6 +62,15 @@ object GameConstants {
     /** Anti-cheat: a client may not have more than this many input commands
      *  processed per second (fixed-step inputs, 60/s is nominal). */
     const val MAX_INPUTS_PER_SECOND: Int = 90
+
+    // ---- P0-3: connection flood protection -------------------------------
+    /** Max brand-new sessions the server accepts per second, globally. */
+    const val MAX_CONNECTS_PER_SECOND: Int = 5
+    /** Max new sessions accepted per second from a single source IP. */
+    const val MAX_CONNECTS_PER_IP_SECOND: Int = 2
+    /** Max simultaneously active (non-zombie) sessions from one source IP.
+     *  Two phones behind one NAT is already rare; this stops a flood script. */
+    const val MAX_SESSIONS_PER_IP: Int = 2
 
     /** How many past input commands are re-sent in each input packet for
      *  redundancy against UDP loss. */

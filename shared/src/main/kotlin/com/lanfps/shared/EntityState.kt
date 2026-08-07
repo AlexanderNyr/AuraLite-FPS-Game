@@ -28,6 +28,14 @@ class EntityState {
     @JvmField var deaths: Int = 0
 
     @JvmField var flags: Int = 0
+
+    /**
+     * Local-only label. NOT serialized on the wire since the P0-1 change: sending
+     * the nickname with every entity in every 30 Hz snapshot could push a full
+     * server past the UDP MTU (especially with 2-byte-per-char names) and cause
+     * IP fragmentation. Names now travel once, in LOBBY_STATE, and the client
+     * joins them to entities by id via a roster map.
+     */
     @JvmField var name: String = ""
 
     var alive: Boolean
@@ -72,7 +80,7 @@ class EntityState {
         w.writeU8(MathUtil.clamp(health, 0, 255))
         w.writeU16(MathUtil.clamp(kills, 0, 65535))
         w.writeU16(MathUtil.clamp(deaths, 0, 65535))
-        w.writeString(name, GameConstants.MAX_NICKNAME_LENGTH * 4)
+        // NB: no name. See the field comment — names moved to LOBBY_STATE.
     }
 
     fun read(r: BinaryReader): EntityState {
@@ -88,7 +96,8 @@ class EntityState {
         health = r.readU8()
         kills = r.readU16()
         deaths = r.readU16()
-        name = r.readString()
+        // NB: no name on the wire anymore (see the field comment). The client
+        // fills it from the LOBBY_STATE roster.
         return this
     }
 

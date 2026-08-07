@@ -10,6 +10,9 @@ import com.lanfps.shared.PacketTypes
 import com.lanfps.shared.Packets
 import com.lanfps.shared.Protocol
 import com.lanfps.shared.ProtocolException
+import java.net.InetAddress
+import java.util.ArrayDeque
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.locks.LockSupport
 
 /**
@@ -52,6 +55,15 @@ class GameServer(private val config: ServerConfig) {
     private var tickCount = 0
     private var ticksThisSecond = 0
     private var rejectedPackets = 0L
+    private var rejectedConnects = 0L
+
+    // ---- P0-3: connection flood protection --------------------------------
+    // Timestamps of recently accepted brand-new connects, for a sliding 1 s
+    // window (global and per-IP). The simulation thread is single-threaded so
+    // no locking is needed.
+    private val recentConnectTimes = ArrayDeque<Long>()
+    private val recentConnectPerIp = HashMap<String, ArrayDeque<Long>>()
+    private val connectWindowMs = 1000L
 
     private fun serverTimeMs(): Long = (System.nanoTime() - startNanos) / 1_000_000L
 
@@ -242,15 +254,57 @@ class GameServer(private val config: ServerConfig) {
         val existing = sessions[key]
         if (existing != null) {
             existing.touch(nowMs)
+            // If this was a silent zombie, the mere fact it is talking again means
+            // it reconnected on the same socket - bring it back to life.
+            reactivateIfZombie(existing)
             sendConnectAccepted(existing)
             Log.debug("re-accepted ${existing.nickname} from $key")
             return
         }
 
+        // P0-2: reconnect on a NEW socket via the resume token. If a zombie
+        // session holds the matching token, re-bind it under the new endpoint
+        // and hand back the same id/score/team instead of a fresh session.
+        if (request.resumeToken != 0) {
+            val zombie = sessions.values.firstOrNull {
+                it.resumeToken == request.resumeToken && it.zombie
+            }
+            if (zombie != null) {
+                sessions.remove(zombie.key)
+                zombie.key = key
+                zombie.address = p.address
+                zombie.port = p.port
+                zombie.touch(nowMs)
+                zombie.zombie = false
+                zombie.zombieDeadlineMs = 0
+                sessions[key] = zombie
+                sendConnectAccepted(zombie)
+                Log.info(
+                    "RECONNECT '${zombie.nickname}' id=${zombie.id} via token from $key " +
+                        "(slot kept, score/team preserved)",
+                )
+                return
+            }
+        }
+
+        // P0-3: flood protection. New sessions are rate-limited before we spend
+        // any CPU or hand out a slot.
+        if (!allowConnect(p.address)) {
+            rejectedConnects++
+            reject(p.address, p.port, "Connection rate limited - please retry in a moment")
+            Log.warn("rejected connection from $key: rate limited")
+            return
+        }
+        if (countSessionsForIp(p.address) >= config.maxSessionsPerIp) {
+            rejectedConnects++
+            reject(p.address, p.port, "Too many connections from this device/network")
+            Log.warn("rejected connection from $key: too many sessions for this IP")
+            return
+        }
+
         if (sessions.size >= config.maxPlayers) {
-            Protocol.begin(writer, PacketTypes.CONNECT_REJECTED)
-            Packets.writeConnectRejected(writer, "Server is full (${config.maxPlayers} players)")
-            socket.send(writer.buffer, Protocol.end(writer), p.address, p.port)
+            rejectedConnects++
+            reject(p.address, p.port, "Server is full (${config.maxPlayers} players)")
             Log.info("rejected connection from $key: server full")
             return
         }
@@ -271,6 +325,10 @@ class GameServer(private val config: ServerConfig) {
         val nickname = sanitizeNickname(request.nickname)
         val id = allocatePlayerId()
         val session = ClientSession(id, p.address, p.port, nickname)
+        // P0-2: hand the client an opaque token it can present to resume this
+        // exact session (same id/score/team) after a silent disconnect.
+        session.resumeToken = ThreadLocalRandom.current().nextInt(1, Int.MAX_VALUE)
+        session.serverTimeoutMs = config.serverTimeoutMs
         session.touch(nowMs)
         sessions[key] = session
 
@@ -302,6 +360,7 @@ class GameServer(private val config: ServerConfig) {
             serverTimeMs = serverTimeMs()
             assignedNickname = session.nickname
             arenaHash = serverArena.def.hash()
+            resumeToken = session.resumeToken
         }
         Protocol.begin(writer, PacketTypes.CONNECT_ACCEPTED)
         Packets.writeConnectAccepted(writer, accepted)
@@ -319,6 +378,7 @@ class GameServer(private val config: ServerConfig) {
             return
         }
         session.touch(nowMs)
+        reactivateIfZombie(session)
 
         Packets.readClientInput(reader, inputPacket)
         if (inputPacket.playerId != session.id) {
@@ -331,7 +391,11 @@ class GameServer(private val config: ServerConfig) {
 
     private fun handlePing(p: InboundPacket, nowMs: Long) {
         val clientTime = Packets.readPing(reader)
-        sessions[ClientSession.endpointKey(p.address, p.port)]?.touch(nowMs)
+        val session = sessions[ClientSession.endpointKey(p.address, p.port)]
+        if (session != null) {
+            session.touch(nowMs)
+            reactivateIfZombie(session)
+        }
 
         Protocol.begin(writer, PacketTypes.PONG)
         Packets.writePong(writer, clientTime, serverTimeMs())
@@ -358,19 +422,87 @@ class GameServer(private val config: ServerConfig) {
         while (iterator.hasNext()) {
             val session = iterator.next().value
             if (!session.isTimedOut(nowMs)) continue
-            iterator.remove()
-            world.removeEntity(session.id)
+
+            if (!session.zombie) {
+                // P0-2: first silence timeout turns the session into a zombie.
+                // We deliberately KEEP the entity in the world (standing still,
+                // still shootable) so its score/team are preserved for a
+                // reconnect with the resume token.
+                session.zombie = true
+                session.zombieDeadlineMs = nowMs + config.zombieTimeoutMs
+                Log.info(
+                    "TIMEOUT '${session.nickname}' id=${session.id} -> zombie for " +
+                        "${config.zombieTimeoutMs} ms (awaiting reconnect)",
+                )
+            } else if (nowMs >= session.zombieDeadlineMs) {
+                iterator.remove()
+                world.removeEntity(session.id)
+                Log.info(
+                    "ZOMBIE EXPIRED '${session.nickname}' id=${session.id} - slot reclaimed",
+                )
+                match.pendingEvents.add(
+                    Packets.MatchEvent().apply {
+                        eventType = MatchEventType.PLAYER_LEFT
+                        killerId = session.id
+                        killerName = session.nickname
+                    },
+                )
+            }
+        }
+        pruneConnectWindows(nowMs)
+    }
+
+    // ---- P0-2/P0-3 helpers --------------------------------------------------
+
+    /** Clears the zombie flag on a session that just sent a packet again. */
+    private fun reactivateIfZombie(session: ClientSession) {
+        if (session.zombie) {
+            session.zombie = false
+            session.zombieDeadlineMs = 0
             Log.info(
-                "TIMEOUT '${session.nickname}' id=${session.id} " +
-                    "(no packets for ${GameConstants.SERVER_TIMEOUT_MS} ms)",
+                "session '${session.nickname}' id=${session.id} re-activated from zombie",
             )
-            match.pendingEvents.add(
-                Packets.MatchEvent().apply {
-                    eventType = MatchEventType.PLAYER_LEFT
-                    killerId = session.id
-                    killerName = session.nickname
-                },
-            )
+        }
+    }
+
+    /** Sends a CONNECT_REJECTED with the given reason (uses the shared writer). */
+    private fun reject(address: InetAddress, port: Int, reason: String) {
+        Protocol.begin(writer, PacketTypes.CONNECT_REJECTED)
+        Packets.writeConnectRejected(writer, reason)
+        socket.send(writer.buffer, Protocol.end(writer), address, port)
+    }
+
+    /** P0-3: checks the global + per-IP sliding-window connect limits. */
+    private fun allowConnect(address: InetAddress): Boolean {
+        val now = System.currentTimeMillis()
+        val ip = address.hostAddress
+        pruneQueue(recentConnectTimes, now)
+        if (recentConnectTimes.size >= config.maxConnectsPerSecond) return false
+
+        val perIp = recentConnectPerIp.getOrPut(ip) { ArrayDeque() }
+        pruneQueue(perIp, now)
+        if (perIp.size >= config.maxConnectsPerIpPerSecond) return false
+
+        recentConnectTimes.addLast(now)
+        perIp.addLast(now)
+        return true
+    }
+
+    /** How many sessions (including zombies) are active for a source IP. */
+    private fun countSessionsForIp(address: InetAddress): Int =
+        sessions.values.count { it.address.hostAddress == address.hostAddress }
+
+    private fun pruneQueue(q: ArrayDeque<Long>, now: Long) {
+        while (q.isNotEmpty() && now - q.first() >= connectWindowMs) q.removeFirst()
+    }
+
+    /** Drops empty per-IP windows so the map cannot grow without bound. */
+    private fun pruneConnectWindows(now: Long) {
+        val it = recentConnectPerIp.entries.iterator()
+        while (it.hasNext()) {
+            val e = it.next()
+            pruneQueue(e.value, now)
+            if (e.value.isEmpty()) it.remove()
         }
     }
 
@@ -450,7 +582,9 @@ class GameServer(private val config: ServerConfig) {
                 "time=${match.timeRemaining.toInt()}s " +
                 "score[${world.scoreSummary()}] " +
                 "rx=${socket.packetsReceived.get()} tx=${socket.packetsSent.get()} " +
-                "rejected=$rejectedPackets snapPeak=${snapshotBuilder.peakSize}B",
+                "rejected=$rejectedPackets rejectedConnects=$rejectedConnects " +
+                "zombies=${sessions.values.count { it.zombie }} " +
+                "snapPeak=${snapshotBuilder.peakSize}B",
         )
         for (session in sessions.values) {
             Log.debug(

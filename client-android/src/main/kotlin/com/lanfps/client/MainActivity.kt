@@ -307,7 +307,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         AndroidLog.i("phase -> $phase")
 
         menu.visibility = if (phase == Phase.MENU || phase == Phase.CONNECTING ||
-            phase == Phase.DISCONNECTED
+            phase == Phase.DISCONNECTED || phase == Phase.RECONNECTING
         ) View.VISIBLE else View.GONE
 
         lobby.visibility = if (phase == Phase.LOBBY) View.VISIBLE else View.GONE
@@ -334,6 +334,8 @@ class MainActivity : Activity(), NetworkClient.Listener {
             }
 
             Phase.CONNECTING -> menu.setStatus(state.statusText)
+
+            Phase.RECONNECTING -> menu.setStatus(state.statusText)
 
             Phase.DISCONNECTED -> {
                 menu.setStatus(state.errorText.ifEmpty { "Disconnected." }, error = true)
