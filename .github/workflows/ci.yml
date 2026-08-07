@@ -29,6 +29,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      # The Gradle wrapper must be executable. Git cannot carry the unix +x bit
+      # through a zip extracted on Windows, so the committed mode can end up
+      # 100644 and `./gradlew` fails with "Permission denied" (exit 126) on the
+      # Linux runner. Re-assert it explicitly so CI never depends on how the
+      # repo was checked out.
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x gradlew
+
       - name: Run the shared + server test suites
         run: ./gradlew :shared:test :server:test --console=plain --stacktrace
 
@@ -84,6 +92,11 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
+
+      # Same as the server job: re-assert the wrapper's exec bit so `./gradlew`
+      # works regardless of the mode git stored for it (see note there).
+      - name: Ensure Gradle wrapper is executable
+        run: chmod +x gradlew
 
       - name: Generate a local signing key
         # The real key is gitignored on purpose. CI makes a throwaway one so the
