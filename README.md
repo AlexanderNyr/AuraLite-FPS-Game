@@ -135,7 +135,8 @@ lanfps/
 │   │   ├── Main.kt            arg parsing, banner, shutdown hook
 │   │   ├── GameServer.kt      protocol, 60 Hz tick loop, rotation, votes, metrics
 │   │   ├── SessionManager.kt  sessions: flood guard, zombies, reconnects (P0/P3-4)
-│   │   ├── UdpServerSocket.kt receive/send, CRC validation
+│   │   ├── UdpServerSocket.kt receive/send, CRC validation, PING fast reply
+│   │   │                        on the rx thread (tick-free ping reads, P7-1)
 │   │   ├── ClientSession.kt   per-client state, input queue, RTT/loss metrics
 │   │   ├── World.kt           entities, weapons/ammo rules, damage, respawn
 │   │   ├── Physics.kt         drives the shared MovementSolver

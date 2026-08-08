@@ -19,6 +19,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Toast
+import android.net.wifi.WifiManager
 import com.lanfps.shared.ArenaDef
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
@@ -55,6 +56,16 @@ class MainActivity : Activity(), NetworkClient.Listener {
     private lateinit var pausePanel: LinearLayout
 
     private var net: NetworkClient? = null
+
+    /**
+     * P7-3: held for the whole session. Without it the phone's Wi-Fi stack is
+     * free to doze between beacon intervals and the AP buffers our downstream
+     * packets until the next DTIM — that is the standard reason a LAN game
+     * shows 60–200 ms of "physically impossible" ping on a phone. LOW_LATENCY
+     * mode (API 29+) instructs the firmware to disable that power save;
+     * HIGH_PERF is the legacy equivalent below 29.
+     */
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val ui = Handler(Looper.getMainLooper())
     private var lastPhase: Phase? = null
@@ -230,6 +241,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         stopUiTicker()
         net?.stopNow()
         net = null
+        setLowLatencyWifi(false)
         SoundManager.release() // P1-3: free the AudioTrack
         super.onDestroy()
     }
@@ -451,6 +463,40 @@ class MainActivity : Activity(), NetworkClient.Listener {
 
     // ------------------------------------------------------------ networking
 
+    /**
+     * P7-3: holds/releases the low-latency Wi-Fi lock. Every failure here is
+     * deliberately non-fatal: the game must run exactly as before on a device
+     * whose firmware refuses the lock.
+     */
+    @Synchronized
+    @Suppress("DEPRECATION")
+    private fun setLowLatencyWifi(active: Boolean) {
+        try {
+            if (active) {
+                if (wifiLock == null) {
+                    val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                    val mode = if (Build.VERSION.SDK_INT >= 29) {
+                        WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    } else {
+                        WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                    }
+                    wifiLock = wm.createWifiLock(mode, "lanfps:game").apply {
+                        setReferenceCounted(false)
+                    }
+                }
+                if (wifiLock?.isHeld == false) {
+                    wifiLock?.acquire()
+                    AndroidLog.i("low-latency Wi-Fi lock acquired")
+                }
+            } else if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+                AndroidLog.i("low-latency Wi-Fi lock released")
+            }
+        } catch (e: Exception) {
+            AndroidLog.w("wifi lock toggle failed: ${e.message}")
+        }
+    }
+
     private fun connect(ip: String, port: Int, nick: String, password: String) {
         prefs.edit()
             .putString("nick", nick)
@@ -470,6 +516,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         net?.stopNow()
         val client = NetworkClient(state, input, arena, this)
         net = client
+        setLowLatencyWifi(true)
         client.start(ip, port, nick)
     }
 
@@ -477,6 +524,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         AndroidLog.i("leaving server")
         net?.stop()
         net = null
+        setLowLatencyWifi(false)
         state.resetForNewSession()
         state.phase = Phase.MENU
         ui.post {
@@ -521,10 +569,12 @@ class MainActivity : Activity(), NetworkClient.Listener {
     }
 
     override fun onRejected(reason: String) {
+        setLowLatencyWifi(false)
         ui.post { menu.setStatus("Server refused the connection: $reason", error = true) }
     }
 
     override fun onDisconnected(reason: String, wasError: Boolean) {
+        setLowLatencyWifi(false)
         ui.post {
             menu.setStatus(reason, error = wasError)
             if (wasError) {

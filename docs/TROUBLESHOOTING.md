@@ -156,10 +156,27 @@ On a healthy LAN `ping` is 1–15 ms and `snap/s` is ~30.
 
 ## 6. Ping is high (> 60 ms) on a LAN
 
-- Wi-Fi power saving on the phone. Disable battery optimisation for LAN FPS:
+Before chasing the network, make sure the build is current: older builds
+measured a round trip that *included* up to a full server tick of sleep —
+on a sub-millisecond LAN that alone reported 5–30 ms, more on a Windows
+server with a coarse timer quantum. Current builds answer PINGs on the
+server's UDP receive thread (wire time only) and hold a low-latency Wi-Fi
+lock on the phone while connected, so idle figure on a clean LAN should be
+single-digit milliseconds.
+
+If it is still high on a current build:
+
+- Wi-Fi power saving on the phone (the usual culprit — the access point
+  buffers packets destined for a dozing phone until the next beacon). Disable
+  battery optimisation for LAN FPS:
   *Settings → Apps → LAN FPS → Battery → Unrestricted*.
+- Battery-saver mode on the phone overrides the game's low-latency Wi-Fi
+  request on some firmware — turn it off while playing.
 - Another device is saturating the Wi-Fi (4K streaming, big download).
 - 2.4 GHz band congestion — switch to 5 GHz.
+- The server machine is asleep at the wheel: a laptop CPU parked in C-states
+  or a Windows box on a "Power saver" plan adds several ms to every packet.
+  Prefer a wired server on a balanced/high-performance plan.
 
 ---
 

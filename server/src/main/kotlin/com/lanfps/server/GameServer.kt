@@ -33,7 +33,13 @@ import java.util.concurrent.locks.LockSupport
  */
 class GameServer(private val config: ServerConfig) {
 
-    private lateinit var socket: UdpServerSocket
+    /**
+     * P7-1: no longer private — the transport's observability counters
+     * (fast ping replies, throttles, drops) are part of the ops surface and
+     * are asserted on by the test suite. Convention: hands off outside the
+     * server internals.
+     */
+    lateinit var socket: UdpServerSocket
     private lateinit var world: World
     private lateinit var match: MatchController
 
@@ -95,7 +101,10 @@ class GameServer(private val config: ServerConfig) {
         )
         world.setBotCount(config.botCount)
 
-        socket = UdpServerSocket(config.bindAddress, config.udpPort)
+        // P7-1: the clock lambda feeds the transport's fast PING replies (they
+        // are sent from the receive thread; embedding the server-time field
+        // there keeps them byte-identical to the old sim-loop replies).
+        socket = UdpServerSocket(config.bindAddress, config.udpPort) { serverTimeMs() }
         socket.bind()
         running = true
 
@@ -484,6 +493,12 @@ class GameServer(private val config: ServerConfig) {
             sessionManager.reactivateIfZombie(session)
         }
 
+        // P7-1: the receive thread already answered this PING on arrival (see
+        // UdpServerSocket's fast path); only the bookkeeping above remains for
+        // the simulation thread. A second PONG would double the client's RTT
+        // sample rate and poison its smoothing.
+        if (p.pingAnswered) return
+
         Protocol.begin(writer, PacketTypes.PONG)
         Packets.writePong(writer, clientTime, serverTimeMs())
         socket.send(writer.buffer, Protocol.end(writer), p.address, p.port)
@@ -501,10 +516,15 @@ class GameServer(private val config: ServerConfig) {
         if (session.lastServerPingSentMs > 0) {
             val rtt = (System.currentTimeMillis() - session.lastServerPingSentMs).toDouble()
             if (rtt in 0.0..4000.0) {
+                // P7-2: asymmetric smoothing. A transient spike (one buffered
+                // beacon burst on a dozing phone) must not keep the lag-comp
+                // rewind deep for seconds; a genuinely calmer link should be
+                // credited almost immediately. Lower sample -> faster alpha.
+                val alpha = if (session.smoothedRttMs > 0.0 && rtt < session.smoothedRttMs) 0.5 else 0.25
                 session.smoothedRttMs = if (session.smoothedRttMs == 0.0) {
                     rtt
                 } else {
-                    session.smoothedRttMs + (rtt - session.smoothedRttMs) * 0.25
+                    session.smoothedRttMs + (rtt - session.smoothedRttMs) * alpha
                 }
                 session.addRttSample(rtt)
             }

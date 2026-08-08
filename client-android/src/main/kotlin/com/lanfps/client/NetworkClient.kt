@@ -989,7 +989,14 @@ class NetworkClient(
                         Packets.readPong(reader, pong)
                         val rtt = (System.currentTimeMillis() - pong.clientTimeMs).toDouble()
                         if (rtt in 0.0..4000.0) {
-                            rttMs = if (!haveRtt) rtt else rttMs + (rtt - rttMs) * 0.25
+                            // P7-2: asymmetric smoothing. The 1 Hz sample rate
+                            // means a slow alpha keeps a stale spike on the HUD
+                            // for ~4 s — long enough to look "physically
+                            // impossible" on a LAN. Trust good news fast
+                            // (alpha 0.5), spread bad news slowly (alpha 0.25)
+                            // so one buffered beacon burst cannot swamp the readout.
+                            val alpha = if (haveRtt && rtt < rttMs) 0.5 else 0.25
+                            rttMs = if (!haveRtt) rtt else rttMs + (rtt - rttMs) * alpha
                             haveRtt = true
                             state.pingMs = rttMs.toInt()
                         }
