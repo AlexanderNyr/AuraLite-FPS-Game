@@ -182,6 +182,20 @@ class World(
                 applyWeaponIntent(e, cmd)
                 physics.step(e, cmd, dt)
                 handleFire(e, cmd.firePressed)
+
+                // Lag-spike catch-up: the queue is deep, so serve the client
+                // extra commands right now instead of dropping them later.
+                // Each extra step is another full physics sub-tick, so the
+                // server-side position rejoins the client's prediction quickly
+                // and the client sees one small correction instead of a
+                // hard-snap teleport when the oldest commands get dropped.
+                val extra = session.extraCatchUpInputs()
+                for (k in 0 until extra) {
+                    val catchUp = session.nextCommand() ?: break
+                    applyWeaponIntent(e, catchUp)
+                    physics.step(e, catchUp, dt)
+                    handleFire(e, catchUp.firePressed)
+                }
             } else if (e.alive) {
                 // No input available: keep gravity/physics running with no intent.
                 IDLE_COMMAND.yaw = e.body.yaw

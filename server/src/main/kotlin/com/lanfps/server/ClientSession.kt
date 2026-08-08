@@ -196,6 +196,28 @@ class ClientSession(
         }
     }
 
+    /**
+     * Catch-up variant used when the client got ahead during a lag spike.
+     *
+     * The normal path consumes exactly one command per tick, so after a 300 ms
+     * stall the queue holds ~18 commands and [MAX_QUEUED_INPUTS] starts
+     * dropping the oldest — each drop is a guaranteed client/server position
+     * divergence, which the client then feels as a correction (a rubber-band
+     * or, above its hard-snap threshold, a teleport). Serving a second
+     * command per tick while the queue is deep drains the backlog twice as
+     * fast as it accumulates, with the token bucket (90/s) still capping the
+     * absolute input rate an anti-cheat standpoint.
+     *
+     * @return the number of commands this tick wants to consume beyond the
+     *         first, or 0 when the queue is shallow or tokens are exhausted.
+     */
+    fun extraCatchUpInputs(): Int {
+        if (queue.size < CATCH_UP_QUEUE_MIN) return 0
+        val budget = kotlin.math.floor(tokens).toInt() - 1
+        if (budget <= 0) return 0
+        return minOf(queue.size - 1, budget, CATCH_UP_MAX_PER_TICK)
+    }
+
     /** How many commands are waiting — useful for lag diagnostics. */
     fun queuedInputs(): Int = queue.size
 
@@ -231,6 +253,12 @@ class ClientSession(
     companion object {
         const val MAX_QUEUED_INPUTS = 12
         const val STARVE_EXTRAPOLATE_TICKS = 6
+
+        /** Start catch-up once the client is this many commands ahead (~100 ms). */
+        const val CATCH_UP_QUEUE_MIN = 6
+
+        /** Never consume more than 1+2 commands in a single tick. */
+        const val CATCH_UP_MAX_PER_TICK = 2
         private const val RTT_SAMPLE_CAP = 48
 
         fun endpointKey(address: InetAddress, port: Int): String =

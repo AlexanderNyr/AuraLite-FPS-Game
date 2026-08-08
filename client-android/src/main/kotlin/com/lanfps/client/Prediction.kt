@@ -152,7 +152,7 @@ class Prediction(@Volatile private var arena: ArenaDef) {
             // smoothing would look worse than an honest cut.
             errorOffset.zero()
             hardSnaps++
-        } else if (err > 0.0005f) {
+        } else if (err > IGNORE_METERS) {
             errorOffset.set(
                 errorOffset.x + dx,
                 errorOffset.y + dy,
@@ -163,16 +163,28 @@ class Prediction(@Volatile private var arena: ArenaDef) {
             if (mag > 0.5f) errorOffset.scale(0.5f / mag)
             corrections++
         }
+        // Errors under IGNORE_METERS are float-noise from the two simulators
+        // rounding differently: adopting them silently avoids a permanent
+        // sub-centimetre wobble that used to fire the correction counter
+        // (and, through errorOffset, the camera) dozens of times per minute.
     }
 
-    /** Fades the residual error. Call once per client tick. */
-    fun decayError(dt: Float) {
+    /**
+     * Fades the residual error. Call once per client tick.
+     *
+     * The time constant follows the player's reported network quality: on a
+     * clean wired LAN (rtt ≈ 0) a fast 120 ms fade keeps the camera honest; on
+     * a lossy link where corrections arrive in bursts a longer tail (up to
+     * 300 ms) spreads the same error over more frames, which reads as gentle
+     * drift instead of a string of micro-teleports.
+     */
+    fun decayError(dt: Float, rttMs: Float = 0f) {
         if (errorOffset.lengthSquared() < 1e-8f) {
             errorOffset.zero()
             return
         }
-        // Exponential decay with a ~120 ms time constant.
-        val k = exp(-dt / 0.12f)
+        val tau = (0.12f + rttMs / 1000f).coerceAtMost(0.30f)
+        val k = exp(-dt / tau)
         errorOffset.scale(k)
     }
 
@@ -195,5 +207,8 @@ class Prediction(@Volatile private var arena: ArenaDef) {
     companion object {
         /** Above this the correction is cut instead of smoothed. */
         const val HARD_SNAP_METERS: Float = 1.5f
+
+        /** Below this the correction is adopted silently (sim-rounding noise). */
+        const val IGNORE_METERS: Float = 0.002f
     }
 }

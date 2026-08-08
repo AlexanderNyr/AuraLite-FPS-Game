@@ -75,7 +75,15 @@ object GameConstants {
 
     /** How many past input commands are re-sent in each input packet for
      *  redundancy against UDP loss. */
-    const val INPUT_REDUNDANCY: Int = 3
+    /**
+     * Newest N-1 commands re-sent with every input packet. One lost datagram is
+     * fully healed by the next one; bursts of 2-4 losses (typical Wi-Fi flap)
+     * used to force the server into starvation-extrapolation and then hit the
+     * client with a correction the moment the queue healed — the "teleport"
+     * players report as high ping. 6 keeps ~100 ms of cover for ~150 bytes of
+     * extra upstream traffic per second (negligible even on 2.4 GHz Wi-Fi).
+     */
+    const val INPUT_REDUNDANCY: Int = 6
 
     // ---- P1-4: reliable match events -------------------------------------
     /** Hard cap on unacknowledged MATCH_EVENTs held per session. */

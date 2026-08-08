@@ -10,7 +10,9 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.Material
 import com.lanfps.shared.MathUtil
+import com.lanfps.shared.RayMath
 import com.lanfps.shared.Team
+import com.lanfps.shared.Vec3
 import com.lanfps.shared.Weapons
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -31,7 +33,12 @@ import kotlin.math.sin
  * detail layer multiplied by the original palette colour, so the look is a
  * strictly-upgraded version of the old flat one. Each material is its own
  * small mesh + draw call (~8 world draws total), still nothing for a GPU.
- * The sky is a fullscreen triangle ray-cast against a panorama texture.
+ * The sky is an inward-facing 24-sided cylinder textured with the generated
+ * night panorama, completed in-shader by a sun disc (anchored to the diffuse
+ * light direction so shadows and sun agree) and a slowly drifting procedural
+ * cloud layer. Shadows come in two cheap layers: a baked contact darkening of
+ * floor tiles near static geometry, and per-frame blob quads under every live
+ * player that fade with drop height.
  */
 class GameRenderer(
     private val state: ClientGameState,
@@ -56,6 +63,7 @@ class GameRenderer(
     private var litShader: ShaderProgram? = null
     private var flatShader: ShaderProgram? = null
     private var skyShader: ShaderProgram? = null
+    private var shadowShader: ShaderProgram? = null
 
     /** One mesh per material id, so each can bind its own texture. */
     private val materialMeshes = HashMap<Int, Mesh>(6)
@@ -66,6 +74,11 @@ class GameRenderer(
     // UVs, so it piggy-backs on it (a handful of unused floats per vertex).
     private val skyMesh = Mesh(hasNormals = true, drawMode = GLES30.GL_TRIANGLES)
     private val effectMesh = DynamicMesh(hasNormals = false, maxVertices = 6 * 64)
+    // Contact shadows under players: rebuilt every frame, one alpha-blended
+    // batch. Uses the lit layout purely because that is the one that carries
+    // UVs (same trick as the sky mesh).
+    private val shadowMesh = Mesh(hasNormals = true)
+    private val shadowBuilder = MeshBuilder(withNormals = true, initialCapacity = 4096)
 
     // ---- textures -----------------------------------------------------------
     private val materialTex = HashMap<Int, Int>(6)
@@ -87,6 +100,11 @@ class GameRenderer(
     private var lastFrameNanos = 0L
     private var timeSec = 0f
     private var bobPhase = 0f
+
+    // Scratch for the shadow pass (ray start / ray dir). The renderer is
+    // single-threaded, so two reusable Vec3s are plenty.
+    private val shadowRay = Vec3()
+    private val shadowDir = Vec3(0f, -1f, 0f)
     private var weaponKick = 0f
     private var frameCount = 0
     private var fpsAccum = 0f
@@ -106,6 +124,7 @@ class GameRenderer(
         litShader = ShaderProgram("lit", LIT_VS, LIT_FS)
         flatShader = ShaderProgram("flat", FLAT_VS, FLAT_FS)
         skyShader = ShaderProgram("sky", SKY_VS, SKY_FS)
+        shadowShader = ShaderProgram("shadow", SHADOW_VS, SHADOW_FS)
 
         loadTextures()
         buildSkyMesh()
@@ -166,23 +185,39 @@ class GameRenderer(
      * wrap seamlessly. Radius 110 sits well inside the 260 m far plane, and the
      * shell is drawn with depth-writes off so the world always occludes it.
      *
-     * UV note: u spans 0..12 around the equator (12 horizontal repeats densify
-     * the star field), v runs bottom-up; v=0 is clamped to the horizon glow.
+     * UV mapping (v2 — the fix for the "stretched sky" report):
+     *  - u spans exactly 0..1 around the full 360°: the art is a 2:1 equirect
+     *    panorama, so one wrap is the only non-distorted choice. The previous
+     *    12× repeat mosaic was wrong for this texture.
+     *  - v is flipped versus the naive bottom-up read: `GLUtils.texImage2D`
+     *    stores bitmap row 0 (the image TOP, the dark zenith half) at v=0, so
+     *    v=0 is the zenith and v=1 is the image BOTTOM, where the horizon glow
+     *    band lives. The cylinder therefore maps its lower rim to v=1 (y just
+     *    under the eye, so the glow ring peeks over the far walls exactly at
+     *    the horizon line) and its top to v≈0.05; the zenith fan samples the
+     *    clamped v=0 edge, i.e. the darkest part of the photo.
+     *
+     * The sun disc and the drifting cloud strata are procedural — they are
+     * evaluated in SKY_FS from the look direction (vDir), not baked into this
+     * mesh, so they never stretch regardless of shell geometry.
      */
     private fun buildSkyMesh() {
         val b = MeshBuilder(withNormals = true, initialCapacity = 8192)
         val radius = 110f
-        val yTop = 60f
-        val yBot = -34f
-        val segs = 24
-        val repeats = 12f
+        val yTop = 62f
+        val yBot = -10f
+        val segs = 32
+        // v=1 is the image bottom (the horizon glow), v=0 the dark zenith.
+        val vBot = 1.0f
+        val vTop = 0.045f
         for (i in 0 until segs) {
             val a0 = (i * Math.PI * 2 / segs).toFloat()
             val a1 = ((i + 1) * Math.PI * 2 / segs).toFloat()
             val x0 = cos(a0) * radius; val z0 = sin(a0) * radius
             val x1 = cos(a1) * radius; val z1 = sin(a1) * radius
-            val u0 = i * repeats / segs
-            val u1 = (i + 1) * repeats / segs
+            // One seamless wrap of the 2:1 panorama around the horizon.
+            val u0 = i.toFloat() / segs
+            val u1 = (i + 1).toFloat() / segs
             // Winding is CCW *as seen from inside* (the camera is always
             // inside the shell), so the front face survives backface culling.
             val nx = -(x0 + x1); val nz = -(z0 + z1)
@@ -193,14 +228,15 @@ class GameRenderer(
                 x0, yTop, z0,
                 nx, 0f, nz,
                 1f, 1f, 1f,
-                u0, 0f,
-                u1, 0f,
-                u1, 1f,
-                u0, 1f,
+                u0, vBot,
+                u1, vBot,
+                u1, vTop,
+                u0, vTop,
             )
         }
         // Zenith disc: closes the hole at the top of the cylinder. It samples
-        // a small patch near the texture's top edge — dim, uniform sky.
+        // a hard against the clamped v=0 edge — the darkest, most uniform row
+        // of the zenith half, so the cap is effectively flat with no seams.
         for (i in 0 until segs) {
             val a0 = (i * Math.PI * 2 / segs).toFloat()
             val a1 = ((i + 1) * Math.PI * 2 / segs).toFloat()
@@ -213,10 +249,10 @@ class GameRenderer(
                 0f, yTop, 0f,
                 0f, -1f, 0f,
                 1f, 1f, 1f,
-                0f, 0.86f,
-                0.10f, 0.86f,
-                0.10f, 0.92f,
-                0f, 0.86f,
+                0.47f, 0.006f,
+                0.49f, 0.006f,
+                0.49f, 0.030f,
+                0.47f, 0.006f,
             )
         }
         skyMesh.upload(b.raw(), b.floatCount)
@@ -282,6 +318,9 @@ class GameRenderer(
         sky.use()
         sky.setMatrix("uViewProj", camera.viewProjection)
         sky.setSampler("uTex", 0)
+        sky.setVec3("uEye", camera.x, camera.y, camera.z)
+        sky.setVec3("uSunDir", LIGHT_X, LIGHT_Y, LIGHT_Z)
+        sky.setFloat("uTime", timeSec)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, skyTex)
         GLES30.glDepthMask(false)
@@ -325,6 +364,28 @@ class GameRenderer(
             drawPlayer(lit, e)
         }
 
+        // ---- player contact shadows -----------------------------------------
+        // Soft blob shadows projected down onto whatever is under each visible
+        // player (floor, ramp, crate top — one downward ray per body). The
+        // blob fades and widens with drop height, which sells jump arcs with
+        // zero shadow-mapping machinery. Baked AO on the floor (see
+        // floorContactShadow) covers the static geometry, these quads cover
+        // the actors.
+        buildShadowBlobs(localId, spectatingId, playing)
+        if (shadowMesh.vertexCount > 0) {
+            val sh = shadowShader ?: return
+            sh.use()
+            sh.setMatrix("uViewProj", camera.viewProjection)
+            GLES30.glEnable(GLES30.GL_BLEND)
+            GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+            GLES30.glDepthMask(false)
+            GLES30.glDisable(GLES30.GL_CULL_FACE)
+            shadowMesh.draw()
+            GLES30.glEnable(GLES30.GL_CULL_FACE)
+            GLES30.glDepthMask(true)
+            GLES30.glDisable(GLES30.GL_BLEND)
+        }
+
         // ---- tracers & flashes ----------------------------------------------
         state.collectTracers(nowMs, TRACER_TTL_MS, tracers)
         val muzzleActive = playing && nowMs < state.muzzleFlashUntilMs
@@ -350,6 +411,92 @@ class GameRenderer(
             GLES30.glClear(GLES30.GL_DEPTH_BUFFER_BIT)
             drawWeapon(lit)
         }
+    }
+
+    /**
+     * Rebuilds the per-frame contact-shadow batch into [shadowMesh].
+     *
+     * Each visible, alive player gets a radial fan quads-sheet at the floor
+     * height under their feet, found with a single downward ray against the
+     * collision set (so the shadow lands on crates and ramps during movement,
+     * not always on y=0). The fan's centre vertex carries the full shadow
+     * alpha in its red channel and the rim vertices carry zero, so the GPU
+     * interpolates a soft round falloff — no texture, no extra pass state.
+     *
+     * The shadow slides slightly *away* from the sun azimuth as the body
+     * rises (parallax of a point shadow), and fades + widens with drop
+     * height: that is what gives jumps their visual lift.
+     */
+    /**
+     * Baked contact-shadow factor for one floor tile centred at (cx, cz):
+     * 1.0 far away from any solid brush, falling off smoothly to 0.55 right
+     * against one, over a 1.7 m ramp. This is the workhorse static "shadow":
+     * every wall, crate, pillar and piece of cover darkens the floor it
+     * stands on, baked once into the arena vertex colours (and therefore
+     * free at runtime, and automatically rebuilt on map rotation). The
+     * dynamic blob shadows under players are layered on top separately.
+     */
+    private fun floorContactShadow(cx: Float, cz: Float): Float {
+        var nearest = Float.MAX_VALUE
+        for (brush in arena.brushes) {
+            if (!brush.solid || brush.material == Material.FLOOR) continue
+            val b = brush.box
+            if (b.minY > 0.25f) continue // floating props cast no floor AO
+            val dx = maxOf(b.minX - cx, 0f, cx - b.maxX)
+            val dz = maxOf(b.minZ - cz, 0f, cz - b.maxZ)
+            val d = kotlin.math.sqrt(dx * dx + dz * dz).toFloat()
+            if (d < nearest) nearest = d
+        }
+        if (nearest == Float.MAX_VALUE) return 1f
+        val t = (1f - nearest / 1.7f).coerceIn(0f, 1f)
+        return 1f - 0.45f * t * t
+    }
+
+    private fun buildShadowBlobs(localId: Int, spectatingId: Int, playing: Boolean) {
+        shadowBuilder.clear()
+        // Upload of the (possibly empty) batch happens at the bottom so the
+        // previous frame's shadows never linger after a state change.
+        if (!playing) {
+            shadowMesh.upload(shadowBuilder.raw(), 0)
+            return
+        }
+        for (i in renderEntities.indices) {
+            val e = renderEntities[i]
+            if (!e.alive) continue
+            // First-person bodies are not drawn, so neither are their shadows.
+            if (e.id == localId || e.id == spectatingId) continue
+
+            shadowRay.set(e.x, e.y + 0.25f, e.z)
+            val d = RayMath.raycastArena(shadowRay, shadowDir, SHADOW_MAX_DROP, arena)
+            if (d >= SHADOW_MAX_DROP - 0.05f) continue // nothing solid underneath
+            val drop = d - 0.25f
+            // Slide opposite the sun as the drop grows — a point light drags
+            // the shadow sideways; keeps the blob glued to the feet on the
+            // ground and trails naturally through a jump.
+            val cx = e.x - LIGHT_X * drop * 0.45f
+            val cz = e.z - LIGHT_Z * drop * 0.45f
+            val floorY = shadowRay.y - d + 0.03f
+            val fade = (1f - drop / SHADOW_MAX_DROP).coerceIn(0f, 1f)
+            if (fade <= 0.02f) continue
+            val alpha = 0.34f * fade + 0.06f
+            val radius = 0.55f + drop * 0.055f
+
+            // Radial fan as triangle soup: centre vertex opaque-ish, rim zero —
+            // the interpolator does the soft falloff.
+            var prevX = cx + radius
+            var prevZ = cz
+            for (k in 1..SHADOW_SEGMENTS) {
+                val a = (k * Math.PI * 2 / SHADOW_SEGMENTS).toFloat()
+                val nx = cx + cos(a) * radius
+                val nz = cz + sin(a) * radius
+                shadowBuilder.vertex(cx, floorY, cz, 0f, 1f, 0f, alpha, 0f, 0f)
+                shadowBuilder.vertex(prevX, floorY, prevZ, 0f, 1f, 0f, 0f, 0f, 0f)
+                shadowBuilder.vertex(nx, floorY, nz, 0f, 1f, 0f, 0f, 0f, 0f)
+                prevX = nx
+                prevZ = nz
+            }
+        }
+        shadowMesh.upload(shadowBuilder.raw(), shadowBuilder.floatCount)
     }
 
     // ------------------------------------------------------------- cameras
@@ -614,27 +761,32 @@ class GameRenderer(
             MeshBuilder(withNormals = true, initialCapacity = 1 shl 13)
         }
 
-        // Tiled floor: still a 4 m checker (the colour alternation survives as
-        // a tint over the metal texture, which reads great) but each tile now
-        // gets tiled UVs: one texture repeat every 2 metres.
-        val tile = 4f
+        // Tiled floor: still the classic 4 m checker (checker parity is read
+        // off the 4 m block grid), but emitted as 2 m quads so the baked
+        // contact shadow around walls/crates (floorContactShadow below)
+        // shades in a smooth ramp instead of block-wide steps. One texture
+        // repeat every 2 metres as before.
+        val tile = 2f
         val floorB = builderFor(Material.FLOOR)
         var z = arena.minZ
-        var row = 0
         while (z < arena.maxZ - 0.001f) {
             val z1 = min(z + tile, arena.maxZ)
             var x = arena.minX
-            var col = 0
             while (x < arena.maxX - 0.001f) {
                 val x1 = min(x + tile, arena.maxX)
-                val dark = ((row + col) and 1) == 0
+                val blockX = ((x - arena.minX + 0.01f).toInt() / 2)
+                val blockZ = ((z - arena.minZ + 0.01f).toInt() / 2)
+                val dark = ((blockX + blockZ) and 1) == 0
                 val c = if (dark) 0.148f else 0.178f
-                floorB.floorTile(x, z, x1, z1, 0f, c, c * 1.06f, c * 1.22f, uvScale = 2f)
+                val sh = floorContactShadow((x + x1) * 0.5f, (z + z1) * 0.5f)
+                floorB.floorTile(
+                    x, z, x1, z1, 0f,
+                    c * sh, c * 1.06f * sh, c * 1.22f * sh,
+                    uvScale = 2f,
+                )
                 x = x1
-                col++
             }
             z = z1
-            row++
         }
 
         for (brush in arena.brushes) {
@@ -753,6 +905,8 @@ class GameRenderer(
         litShader?.dispose()
         flatShader?.dispose()
         skyShader?.dispose()
+        shadowShader?.dispose()
+        shadowShader = null
         for (mesh in materialMeshes.values) mesh.dispose()
         materialMeshes.clear()
         spawnMesh.dispose()
@@ -760,11 +914,18 @@ class GameRenderer(
         playerMesh.dispose()
         weaponMesh.dispose()
         effectMesh.dispose()
+        shadowMesh.dispose()
         textureLoader.dispose()
     }
 
     companion object {
         private const val TRACER_TTL_MS = 90L
+
+        /** Radial fan resolution for each player's contact shadow. */
+        private const val SHADOW_SEGMENTS = 14
+
+        /** Shadows fade to nothing over this drop (m); also clamps raycasts. */
+        private const val SHADOW_MAX_DROP = 5.5f
 
         // Fog / clear colour: a cool dark blue-grey.
         private const val FOG_R = 0.055f
@@ -837,25 +998,131 @@ class GameRenderer(
          * first with depth writes off. Unlit and unfogged on purpose — fogging
          * the sky would crush the stars into murk; the fog-tinted world already
          * blends toward the same dark palette at distance.
+         *
+         * vDir carries the eye→fragment ray so the fragment shader can layer
+         * procedural elements (sun, clouds) on top of the panorama without
+         * them being affected by the shell's UV distortion.
          */
         private const val SKY_VS = """#version 300 es
             uniform mat4 uViewProj;
+            uniform vec3 uEye;
             in vec3 aPos;
             in vec2 aUv;
             out vec2 vUv;
+            out vec3 vDir;
             void main() {
-                vUv = aUv;
+                vUv  = aUv;
+                vDir = aPos - uEye;
                 gl_Position = uViewProj * vec4(aPos, 1.0);
             }
         """
 
+        /**
+         * Panorama + procedural sun + drifting cloud strata:
+         *  - Sun: a hot white disc exactly along uSunDir (the same direction
+         *    the world lighting uses, so shadows and the sky agree), wrapped
+         *    in three rings of warm halo. Clouds dim it a little when they
+         *    drift across.
+         *  - Clouds: cheap 2-octave value noise sampled in wrap-proof polar
+         *    coordinates (cos/sin of the azimuth), faded out toward the
+         *    horizon glow and the zenith, scrolled slowly with uTime. They
+         *    are ALPHA'd over the photo, not replacing it, so the star field
+         *    still glints through the gaps — night-sky clouds, not day.
+         */
         private const val SKY_FS = """#version 300 es
             precision mediump float;
             uniform sampler2D uTex;
+            uniform vec3  uSunDir;
+            uniform float uTime;
             in vec2 vUv;
+            in vec3 vDir;
+            out vec4 fragColor;
+
+            // Cheap deterministic value noise — one [0,1] cell → 4 hashes.
+            float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+            }
+            float vnoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                vec2 u = f * f * (3.0 - 2.0 * f);
+                float a = hash(i);
+                float b = hash(i + vec2(1.0, 0.0));
+                float c = hash(i + vec2(0.0, 1.0));
+                float d = hash(i + vec2(1.0, 1.0));
+                return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+            }
+
+            void main() {
+                vec3 col = texture(uTex, vUv).rgb;
+                vec3 dir = normalize(vDir);
+                float sunDot = dot(dir, normalize(uSunDir));
+
+                // ---- drifting cloud band ---------------------------------
+                float cloud = 0.0;
+                if (dir.y > 0.01) {
+                    float az = atan(dir.z, dir.x);
+                    // Polar ring coordinates rhug the dome and wrap at ±π with
+                    // no seam (cos/sin are periodic); the radius shrinks toward
+                    // the zenith so the pattern hits it with zero area, i.e.
+                    // no pinwheel artifact. uTime slides the whole ring.
+                    float ringR = 1.8 - clamp(dir.y, 0.0, 1.0) * 1.1;
+                    vec2 cuv = vec2(cos(az), sin(az)) * ringR
+                             + vec2(uTime * 0.0058, uTime * -0.0035);
+                    float n = vnoise(cuv * 1.35) * 0.60
+                            + vnoise(cuv * 3.10 + 17.7) * 0.40;
+                    float band = smoothstep(0.03, 0.20, dir.y)
+                               * (1.0 - smoothstep(0.50, 0.85, dir.y));
+                    cloud = smoothstep(0.52, 0.80, n) * band;
+                    // Cool, dark cloud body with a warm rim on the sun side:
+                    // fits the existing fog palette and the neon horizon.
+                    float sunSide = pow(max(sunDot, 0.0), 3.0);
+                    vec3 cloudCol = vec3(0.11, 0.15, 0.21)
+                                  + vec3(0.40, 0.34, 0.22) * sunSide;
+                    col = mix(col, cloudCol, cloud * 0.72);
+                }
+
+                // ---- sun --------------------------------------------------
+                // Smooth angular falls off from angular thresholds (dot = cos).
+                float disc   = smoothstep(0.99935, 0.99978, sunDot);
+                float corona = pow(max(sunDot, 0.0), 340.0) * 0.85;
+                float halo   = pow(max(sunDot, 0.0), 14.0) * 0.17;
+                // White-hot core, warm halo — stands out against the night
+                // palette without cold-shifting the arena's teal fog accent.
+                vec3 sunCol = vec3(1.00, 0.95, 0.86);
+                vec3 sun = sunCol * (disc * 3.4 + corona + halo);
+                col += sun * (1.0 - cloud * 0.65);
+
+                fragColor = vec4(col, 1.0);
+            }
+        """
+
+        /**
+         * Contact-shadow pass: a single batch of radial fans (one per visible
+         * player). Vertex colour RED carries coverage — 1 at the fan centre,
+         * 0 on the rim — so the rasteriser itself makes the smooth round
+         * falloff. Drawn with straight alpha blending, no texture unit, right
+         * after the player draw loop.
+         */
+        private const val SHADOW_VS = """#version 300 es
+            uniform mat4 uViewProj;
+            in vec3 aPos;
+            in vec3 aColor;
+            out vec3 vColor;
+            void main() {
+                vColor = aColor;
+                gl_Position = uViewProj * vec4(aPos, 1.0);
+            }
+        """
+
+        private const val SHADOW_FS = """#version 300 es
+            precision mediump float;
+            in vec3 vColor;
             out vec4 fragColor;
             void main() {
-                fragColor = vec4(texture(uTex, vUv).rgb, 1.0);
+                // Slightly blue-black so shadows read as ambient occlusion in
+                // the fog scheme rather than as pure soot.
+                fragColor = vec4(0.012, 0.016, 0.030, clamp(vColor.r, 0.0, 1.0));
             }
         """
 

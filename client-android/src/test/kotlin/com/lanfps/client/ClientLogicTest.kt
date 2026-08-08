@@ -76,19 +76,22 @@ class ClientLogicTest {
     @DisplayName("interpolation returns the midpoint between two snapshots")
     fun interpolatesBetweenSnapshots() {
         val buf = SnapshotBuffer()
-        // serverTime = localTime + 1000 -> clock offset is exactly 1000 ms.
-        buf.add(snapshot(1, 10_000, entity(7, x = 0f, z = 0f)), 9_000)
-        buf.add(snapshot(2, 10_100, entity(7, x = 10f, z = 4f)), 9_100)
+        // Arrivals at the nominal 30 Hz cadence: the adaptive render delay
+        // stays at its 90 ms floor and the clock offset is taken from the
+        // most accurate (max) sample: offset = 10_100 - 9_933 = 167 ms.
+        buf.add(snapshot(1, 10_000, entity(7, x = 0f, z = 0f)), 9_900)
+        buf.add(snapshot(2, 10_100, entity(7, x = 10f, z = 4f)), 9_933)
 
-        // renderServerTime = localNow + 1000 - 90. We want 10_050 -> localNow 9_140.
-        assertEquals(10_050L, buf.renderServerTime(9_140))
+        // renderServerTime ~= localNow + 167 - 90; we want ~10_050 -> 9_973.
+        val rt = buf.renderServerTime(9_973)
+        assertTrue(kotlin.math.abs(rt - 10_050) <= 5, "render time $rt should be ~10_050")
 
         val out = ArrayList<EntityState>()
         val pool = ArrayList<EntityState>()
-        assertTrue(buf.sampleInto(out, pool, 9_140))
+        assertTrue(buf.sampleInto(out, pool, 9_973))
         assertEquals(1, out.size)
-        assertEquals(5f, out[0].x, 0.001f, "x should be halfway")
-        assertEquals(2f, out[0].z, 0.001f, "z should be halfway")
+        assertEquals(5f, out[0].x, 0.1f, "x should be halfway")
+        assertEquals(2f, out[0].z, 0.1f, "z should be halfway")
     }
 
     @Test
@@ -121,21 +124,29 @@ class ClientLogicTest {
     @DisplayName("out-of-order snapshots are re-sorted and duplicates dropped")
     fun handlesOutOfOrderAndDuplicates() {
         val buf = SnapshotBuffer()
-        buf.add(snapshot(1, 10_000, entity(7, x = 0f)), 9_000)
-        buf.add(snapshot(3, 10_200, entity(7, x = 20f)), 9_200)
+        // Arrivals spaced at the nominal 30 Hz cadence so the adaptive render
+        // delay sits at its floor (see SnapshotBuffer.jitterMs) — this test
+        // exercises re-sorting and duplicate dropping, not jitter handling.
+        buf.add(snapshot(1, 10_000, entity(7, x = 0f)), 9_900)
+        buf.add(snapshot(3, 10_200, entity(7, x = 20f)), 9_933)
         // Arrives late, belongs in the middle.
-        buf.add(snapshot(2, 10_100, entity(7, x = 10f)), 9_205)
+        buf.add(snapshot(2, 10_100, entity(7, x = 10f)), 9_966)
         // Exact duplicate of tick 2: must be ignored.
-        buf.add(snapshot(2, 10_100, entity(7, x = 999f)), 9_206)
+        buf.add(snapshot(2, 10_100, entity(7, x = 999f)), 9_999)
 
         assertEquals(2, buf.outOfOrderCount)
         assertEquals(4, buf.receivedCount)
 
         val out = ArrayList<EntityState>()
         val pool = ArrayList<EntityState>()
-        // Target 10_150 -> halfway between tick 2 (10_100, x=10) and tick 3 (10_200, x=20).
-        buf.sampleInto(out, pool, 9_240)
-        assertEquals(15f, out[0].x, 0.001f)
+        // Target lands near 10_150 (a fraction of a millisecond of estimator
+        // noise is expected), so derive the expected position from the
+        // buffer's own render time instead of a hardcoded midpoint.
+        val rt = buf.renderServerTime(9_973)
+        assertTrue(kotlin.math.abs(rt - 10_150) <= 6, "render time $rt should be ~10_150")
+        buf.sampleInto(out, pool, 9_973)
+        val expected = 10f + (rt - 10_100).toFloat() / 100f * 10f
+        assertEquals(expected, out[0].x, 0.001f)
     }
 
     @Test

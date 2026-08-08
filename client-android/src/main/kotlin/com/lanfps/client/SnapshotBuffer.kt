@@ -48,9 +48,53 @@ class SnapshotBuffer {
     var outOfOrderCount: Int = 0
         private set
 
+    /**
+     * Exponentially-smoothed arrival jitter (ms), i.e. how much the gap
+     * between consecutive snapshots deviates from the nominal 33 ms. Drives
+     * [renderDelayMs].
+     */
+    @Volatile
+    var jitterMs: Double = 0.0
+        private set
+
+    private var lastRecvMs: Long = 0
+
+    /**
+     * How far behind real time remote entities are drawn.
+     *
+     * The fixed 90 ms works on a clean wired LAN where 30 Hz snapshots glide
+     * in like clockwork. On Wi-Fi with 40–120 ms jitter the same 90 ms is too
+     * shallow: roughly every fifth frame *no* bracketing pair exists, and the
+     * extrapolation clamp yanks enemies into teleports. So the delay floats
+     * with the measured jitter: `base + 2.2 × jitter`, clamped to
+     * 90..300 ms. The cost of a calm link stays zero; a stormy link buys
+     * smoothness with a little extra display lag on *remote* players only —
+     * the local camera never sees this delay at all.
+     */
+    val renderDelayMs: Float
+        get() {
+            val d = GameConstants.INTERPOLATION_DELAY_MS + jitterMs * 2.2
+            return d.coerceIn(
+                GameConstants.INTERPOLATION_DELAY_MS.toDouble(),
+                300.0,
+            ).toFloat()
+        }
+
     fun add(snapshot: Snapshot, localRecvMs: Long) {
         synchronized(lock) {
             receivedCount++
+
+            // Feed the jitter estimator from the gap between consecutive
+            // arrivals. Long gaps (loss) and short gaps (burst catch-up) both
+            // count; the estimator smooths so one bad second does not blow up
+            // the render delay.
+            if (lastRecvMs > 0) {
+                val gap = (localRecvMs - lastRecvMs).toDouble()
+                val expected = 1000.0 / GameConstants.SNAPSHOT_RATE
+                val jitter = kotlin.math.abs(gap - expected)
+                jitterMs += (jitter - jitterMs) * 0.15
+            }
+            lastRecvMs = localRecvMs
 
             val newest = items.lastOrNull()
             val inOrder = newest == null || snapshot.serverTick > newest.serverTick
@@ -102,12 +146,14 @@ class SnapshotBuffer {
             clockOffsetMs = 0.0
             receivedCount = 0
             outOfOrderCount = 0
+            jitterMs = 0.0
+            lastRecvMs = 0
         }
     }
 
     /** Server-timeline instant that should be on screen right now. */
     fun renderServerTime(localNowMs: Long): Long =
-        (localNowMs + clockOffsetMs).toLong() - GameConstants.INTERPOLATION_DELAY_MS
+        (localNowMs + clockOffsetMs - renderDelayMs).toLong()
 
     /**
      * Fills [out] with the interpolated state of every entity at the render

@@ -408,7 +408,9 @@ class NetworkClient(
                 pred?.body?.yaw = cmd.yaw
                 pred?.body?.pitch = cmd.pitch
             }
-            pred?.decayError(GameConstants.TICK_DT)
+            // Corrections fade slower on a laggy link (see Prediction.decayError),
+            // so a burst of them reads as one smooth re-join, not teleport spam.
+            pred?.decayError(GameConstants.TICK_DT, rttMs.toFloat())
             publishLocalTransform(pred, cmd)
 
             // ---- predicted muzzle flash / tracer -----------------------------
