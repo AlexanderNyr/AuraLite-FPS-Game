@@ -203,6 +203,14 @@ object Packets {
             d.removed.addAll(s.deltaRemoved)
             d.write(w)
         }
+        // P4-5/P4-6: pickups and grenades ride every snapshot verbatim — the
+        // sections are small (~8 B/slot) and not worth delta-tracking.
+        val np = if (s.pickups.size > 255) 255 else s.pickups.size
+        w.writeU8(np)
+        for (i in 0 until np) s.pickups[i].write(w)
+        val ng = if (s.grenades.size > 255) 255 else s.grenades.size
+        w.writeU8(ng)
+        for (i in 0 until ng) s.grenades[i].write(w)
     }
 
     fun readSnapshot(r: BinaryReader, out: Snapshot = Snapshot()): Snapshot {
@@ -229,6 +237,12 @@ object Packets {
             out.deltaRemoved.clear()
             out.deltaRemoved.addAll(d.removed)
         }
+        val np = r.readU8()
+        out.pickups.clear()
+        for (i in 0 until np) out.pickups.add(PickupState().read(r))
+        val ng = r.readU8()
+        out.grenades.clear()
+        for (i in 0 until ng) out.grenades.add(GrenadeState().read(r))
         return out
     }
 

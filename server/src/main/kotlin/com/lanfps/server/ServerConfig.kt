@@ -33,6 +33,21 @@ class ServerConfig {
     /** 0..1 — scales bot aim accuracy and reaction speed. */
     var botDifficulty: Float = 0.55f
 
+    /**
+     * P4-7: a named difficulty preset. Sets [botDifficulty] to the preset's
+     * mean; per-bot skill spread (P2-4) still applies on top. A plain float
+     * in `botDifficulty` stays available for fine-tuning.
+     */
+    var botSkillPreset: String = "regular"
+        set(value) {
+            field = value
+            botDifficulty = when (value.trim().lowercase()) {
+                "recruit", "easy", "rookie" -> 0.35f
+                "veteran", "hard", "pro" -> 0.8f
+                else -> 0.55f
+            }
+        }
+
     // ---- P0-3: connection flood protection -------------------------------
     /** Max simultaneous active sessions per source IP. */
     var maxSessionsPerIp: Int = GameConstants.MAX_SESSIONS_PER_IP
@@ -106,6 +121,7 @@ class ServerConfig {
         p.getProperty("arenaFile")?.let { arenaFile = it.trim() }
         p.getProperty("enableDiscovery")?.let { enableDiscovery = it.trim().toBoolean() }
         p.getProperty("botDifficulty")?.toFloatOrNull()?.let { botDifficulty = it }
+        p.getProperty("botSkill")?.let { botSkillPreset = it }
         p.getProperty("maxSessionsPerIp")?.toIntOrNull()?.let { maxSessionsPerIp = it }
         p.getProperty("maxConnectsPerSecond")?.toIntOrNull()?.let { maxConnectsPerSecond = it }
         p.getProperty("maxConnectsPerIpPerSecond")?.toIntOrNull()?.let {

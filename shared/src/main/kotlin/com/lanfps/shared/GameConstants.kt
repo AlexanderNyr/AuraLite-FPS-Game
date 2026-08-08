@@ -11,10 +11,11 @@ object GameConstants {
     /** ASCII "LANF" — first 4 bytes of every packet. */
     const val MAGIC: Int = 0x4C414E46
 
-    /** Bumped to 3 (P2/P3 of the improvement plan): EntityState gained weapon +
-     *  ammo bytes, CONNECT_REQUEST gained a password field, LOBBY_STATE gained
-     *  killLimit + mode votes, and the MODE_VOTE packet type was added. */
-    const val PROTOCOL_VERSION: Int = 3
+    /** Bumped to 4 (P4 content pack): EntityState gained armor + grenade bytes,
+     *  snapshots append pickup- and grenade-sections, MATCH_EVENT learned the
+     *  PICKUP sub-type, InputButtons learned GRENADE and GameMode learned
+     *  INSTAGIB. Older clients/servers refuse each other on BAD_VERSION. */
+    const val PROTOCOL_VERSION: Int = 4
 
     const val DEFAULT_UDP_PORT: Int = 7777
     const val DEFAULT_TCP_PORT: Int = 7778
@@ -128,6 +129,32 @@ object GameConstants {
     const val POST_MATCH_SEC: Float = 12.0f
 
     const val FRIENDLY_FIRE: Boolean = false
+
+    // ---- P4-5: armor (granted by pickups) ----------------------------------
+    /** Maximum armor pool. Absorbs 2/3 of incoming damage until depleted —
+     *  the remaining third always cuts into health, so armor saves, never
+     *  replaces, hit points. */
+    const val MAX_ARMOR: Int = 100
+
+    // ---- P4-6: grenades -----------------------------------------------------
+    /** Grenades every entity carries fresh from respawn. */
+    const val START_GRENADES: Int = 1
+    const val MAX_GRENADES: Int = 4
+    /** Seconds between the throw leave the hand and the blast. */
+    const val GRENADE_FUSE_SEC: Float = 1.7f
+    /** Launch speed of a thrown grenade (dir of the camera). */
+    const val GRENADE_THROW_SPEED: Float = 16f
+    /** Blast damage at ground zero, falling linearly to the radius edge. */
+    const val GRENADE_MAX_DAMAGE: Int = 120
+    const val GRENADE_RADIUS: Float = 6.0f
+    /** Damage retained right at the edge of the blast. */
+    const val GRENADE_EDGE_DAMAGE: Int = 15
+    /** Velocity kept after a wall/floor bounce. */
+    const val GRENADE_RESTITUTION: Float = 0.42f
+    /** Grenades this close to an enemy detonate on impact (direct hit). */
+    const val GRENADE_IMPACT_RADIUS: Float = 0.45f
+    /** Seconds a just-thrown grenade ignores its thrower for self-detonation. */
+    const val GRENADE_SELF_GRACE_SEC: Float = 0.2f
 
     // ---- Identity ----------------------------------------------------------
     const val MAX_NICKNAME_LENGTH: Int = 16

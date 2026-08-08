@@ -37,6 +37,14 @@ class Snapshot {
     /** P1-2: ids removed since the recipient's last keyframe. */
     @JvmField var deltaRemoved: ArrayList<Int> = ArrayList()
 
+    /** P4-5: pickup markers. Always fully serialised (never delta-compressed;
+     *  at ~8 B per slot the section is small and its churn is resend-only). */
+    @JvmField var pickups: ArrayList<PickupState> = ArrayList()
+
+    /** P4-6: live grenades. Fully serialised; an explosion is the id vanishing
+     *  from the list, which the client turns into particles+sound. */
+    @JvmField var grenades: ArrayList<GrenadeState> = ArrayList()
+
     val modeEnum: GameMode get() = GameMode.fromWire(mode)
 
     fun findEntity(id: Int): EntityState? {
@@ -54,6 +62,8 @@ class Snapshot {
         entities.clear()
         deltaChanged.clear()
         deltaRemoved.clear()
+        pickups.clear()
+        grenades.clear()
         return this
     }
 }

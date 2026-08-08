@@ -73,6 +73,22 @@ class MatchController(
             }
             world.killFeed.clear()
         }
+
+        // P4-5: pickups someone consumed become a sound cue / HUD flash on
+        // clients that care (the local picker mainly).
+        if (world.pickupFeed.isNotEmpty()) {
+            for (pk in world.pickupFeed) {
+                pendingEvents.add(
+                    Packets.MatchEvent().apply {
+                        eventType = MatchEventType.PICKUP
+                        killerId = pk.playerId
+                        killerName = pk.playerName
+                        extra = pk.kind.wire
+                    },
+                )
+            }
+            world.pickupFeed.clear()
+        }
     }
 
     fun startMatch() {

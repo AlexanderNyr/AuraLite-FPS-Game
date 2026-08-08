@@ -160,6 +160,35 @@ class ParticleSystem(
         )
     }
 
+    /**
+     * P4-6: a grenade blast. A dense core of fast hot sparks, a handful of
+     * heavy embers arcing a bit longer and a few slow dark soot puffs rising —
+     * three populations read as "explosion" far better than one lump.
+     */
+    fun explosion(x: Float, y: Float, z: Float) {
+        burst(
+            x, y, z, 0f, 1f, 0f,
+            count = 26, speed = 7.5f, spread = 1.1f,
+            ttl = 0.55f, size = 0.055f,
+            r = 1.0f, g = 0.78f, b = 0.42f,
+            gravity = 8.5f,
+        )
+        burst(
+            x, y, z, 0f, 1f, 0f,
+            count = 12, speed = 3.4f, spread = 1.3f,
+            ttl = 0.85f, size = 0.075f,
+            r = 0.95f, g = 0.38f, b = 0.16f,
+            gravity = 5.5f,
+        )
+        burst(
+            x, y + 0.1f, z, 0f, 1f, 0f,
+            count = 6, speed = 1.6f, spread = 0.9f,
+            ttl = 1.1f, size = 0.14f,
+            r = 0.16f, g = 0.15f, b = 0.15f,
+            gravity = -1.8f, // smoke rises
+        )
+    }
+
     /** Sparks jetting forward from the local weapon's muzzle, per shot. */
     fun muzzleSparks(
         x: Float, y: Float, z: Float,

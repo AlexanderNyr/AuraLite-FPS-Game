@@ -47,7 +47,7 @@ class TouchControlsView(
     }
 
     // ---- pointer roles -----------------------------------------------------
-    private enum class Role { NONE, STICK, LOOK, FIRE, JUMP, CROUCH, SCORE, MENU, WEAPON, RELOAD }
+    private enum class Role { NONE, STICK, LOOK, FIRE, JUMP, CROUCH, SCORE, MENU, WEAPON, RELOAD, GRENADE }
 
     private val roles = HashMap<Int, Role>()
 
@@ -76,6 +76,7 @@ class TouchControlsView(
     private var crouchCx = 0f; private var crouchCy = 0f; private var crouchR = 0f
     private var weaponCx = 0f; private var weaponCy = 0f; private var weaponR = 0f
     private var reloadCx = 0f; private var reloadCy = 0f; private var reloadR = 0f
+    private var grenCx = 0f; private var grenCy = 0f; private var grenR = 0f
     private var scoreCx = 0f; private var scoreCy = 0f; private var scoreR = 0f
     private var menuCx = 0f; private var menuCy = 0f; private var menuR = 0f
 
@@ -108,6 +109,12 @@ class TouchControlsView(
         reloadR = dp(30f)
         reloadCx = wf - dp(86f)
         reloadCy = hf - dp(320f)
+
+        // P4-6: grenade toss, small button tucked under the weapon cycler so
+        // weapon column stays one thumb movement: WPN -> GRND -> CROUCH.
+        grenR = dp(30f)
+        grenCx = wf - dp(196f)
+        grenCy = hf - dp(246f)
 
         scoreR = dp(26f)
         scoreCx = wf - dp(44f)
@@ -183,6 +190,7 @@ class TouchControlsView(
             inside(x, y, crouchCx, crouchCy, crouchR + dp(6f)) -> Role.CROUCH
             inside(x, y, weaponCx, weaponCy, weaponR + dp(6f)) -> Role.WEAPON
             inside(x, y, reloadCx, reloadCy, reloadR + dp(6f)) -> Role.RELOAD
+            inside(x, y, grenCx, grenCy, grenR + dp(6f)) -> Role.GRENADE
             x < width * 0.46f -> Role.STICK
             else -> Role.LOOK
         }
@@ -247,6 +255,12 @@ class TouchControlsView(
             Role.RELOAD -> {
                 // P2-2: queued for exactly one network tick (like jump).
                 input.reloadQueued = true
+                performHaptic()
+            }
+
+            Role.GRENADE -> {
+                // P4-6: one press -> one throw request on the next tick.
+                input.grenadeQueued = true
                 performHaptic()
             }
 
@@ -366,6 +380,7 @@ class TouchControlsView(
             Weapons.byId(input.currentWeapon).shortName, 242, 163, 60,
         )
         drawButton(canvas, reloadCx, reloadCy, reloadR, false, "RLD", 226, 232, 240)
+        drawButton(canvas, grenCx, grenCy, grenR, false, "GRN", 226, 232, 240)
         // Scoreboard / menu.
         drawButton(canvas, scoreCx, scoreCy, scoreR, scorePressed, "TAB", 226, 232, 240)
         drawButton(canvas, menuCx, menuCy, menuR, false, "II", 226, 232, 240)

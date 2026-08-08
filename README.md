@@ -207,15 +207,54 @@ Two different problems need two different fixes:
 
 ### The maps
 
-Three original low-poly arenas ship as data, in **both** the jar and the APK's
-assets: `arena01` (the original 60 × 40 m arena — centre pillar, lane dividers,
-crates), `arena02` *Crossfire* (a 44 × 44 open plaza split by a wall cross with
-four diagonal gaps) and `arena03` *Foundry* (a 40 × 30 furnace hall with two
-offset divider walls). Enable rotation in `server.properties`:
+Six original low-poly arenas ship as data, in **both** the jar and the APK's
+assets:
+
+- `arena01` — the original 60 × 40 m arena (centre pillar, lane dividers, crates)
+- `arena02` *Crossfire* — a 44 × 44 plaza split by a wall cross with diagonal gaps
+- `arena03` *Foundry* — a 40 × 30 furnace hall with two offset divider walls
+- `arena04` *Ring* — a 44 × 44 square corridor around a central keep; two launch
+  pads hop onto the keep top where the only ARMOR slot sits
+- `arena05` *Vertical* — elevated side platforms plus a central bridge, three
+  jump pads, SMG parked on the bridge, most of the fight happens in the air
+- `arena06` *Yard* — the duel map: open midfield, staggered crates, one pad onto
+  the tall stack in the middle
+
+Rotation comes enabled by default:
 
 ```properties
-mapRotation=arena01.json,arena02.json,arena03.json
+mapRotation=arena01.json,arena02.json,arena03.json,arena04.json,arena05.json,arena06.json
 ```
+
+### Jump pads, pickups and grenades (P4)
+
+The three new arenas carry **jump pads** (walk over and get launched; works
+identically on the server and in client prediction because the pad lives in
+the shared movement solver), **pickup slots** — health (+40), armor (+50),
+SMG swap and a grenade pouch (+2) — that respawn after use and are *not*
+consumed when they'd do nothing (full health walks past a medkit, the usual
+arena-shooter courtesy), and **hand grenades**: tap the GRN touch button,
+the server lobs a bouncing projectile, fuse 1.7 s, full-power direct hits,
+walls genuinely shelter from splash. Armor absorbs two thirds of incoming
+damage until depleted.
+
+### Instagib (new mode)
+
+`--mode=INSTAGIB` hands everyone an ammo-bottomless one-hit railgun
+(`InstagibDef` in the shared catalogue). No teams, classic scoreboard rules.
+
+### Weapons, ammo and reloads
+
+**Four** hitscan weapons live in one shared catalogue (`WeaponDef.kt`) so the
+server's verdict and the client's tracers/recoil/HUD read the same numbers:
+rifle, shotgun, sniper — and the new **SMG** (60% faster fire, softer hits,
+wider cone: pressure plays instead of picks). Damage, pellets, spread cone,
+rate of fire, magazine, reload time, range and recoil all live there once. The
+shotgun's per-pellet cones are rolled on the server — prediction never guesses
+— and walls stop pellets individually. With the default `infiniteAmmo=false`
+every weapon has a magazine; empty guns reload themselves (the RLD button is a
+convenience, never a requirement). `infiniteAmmo=true` restores the classic
+arena rules: bottomless magazines, the HUD shows `∞`.
 
 Between matches the server swaps the world onto the next map and announces it in
 the `MATCH_START` event (arena name + geometry hash). Clients hot-load the same
@@ -224,25 +263,20 @@ and the render mesh — nobody restarts anything. Both sides hash every map and
 the HUD warns if they ever disagree. No copyrighted assets are used anywhere:
 every texture is a shader, every icon is a vector.
 
-### Weapons, ammo and reloads
-
-Three hitscan weapons live in one shared catalogue (`WeaponDef.kt`) so the
-server's verdict and the client's tracers/recoil/HUD read the same numbers:
-damage, pellets, spread cone, rate of fire, magazine, reload time, range and
-recoil. The shotgun's per-pellet cones are rolled on the server — prediction
-never guesses — and walls stop pellets individually. With the default
-`infiniteAmmo=false` every weapon has a magazine; empty guns reload themselves
-(the RLD button is a convenience, never a requirement). `infiniteAmmo=true`
-restores the classic arena rules: bottomless magazines, the HUD shows `∞`.
-
 ### Bots
 
 Bots fill the server so the game is playable with one phone. They run a small
 state machine — `PATROL` along the waypoint graph → `SEEK` a heard/seen enemy →
-`ATTACK` with human-ish turn rate and aim error → `EVADE` into *actual cover* at
-low health → `RESPAWN_WAIT`. The `botDifficulty` setting is a **mean**: every
-bot gets a fixed individual skill offset, so a match mixes sharp and sloppy
-opponents instead of clones (P2-4). Bots **hear** gunshots within ~30 m and
+`ATTACK` with human-ish turn rate and aim error → `EVADE` into *actual cover*
+at low health → `RESPAWN_WAIT`, plus two P4 behaviours: while patrolling they
+**run for pickups** they can use (GET_PICKUP — hurt bots hunt medkits), and
+against far targets they sometimes **flank** (FLANK — circle to a side angle
+the enemy cannot see before closing in) instead of walking into the crosshair.
+They also throw the occasional grenade at 7–22 m and pick the SMG in the
+pressure band. The `botDifficulty` setting is a **mean**: every bot gets a
+fixed individual skill offset, so a match mixes sharp and sloppy opponents
+instead of clones (P2-4); `botSkill=recruit|regular|veteran` is the named
+sugar for three difficulty snapshots. Bots **hear** gunshots within ~30 m and
 investigate, pick the sane weapon for their engagement range (sniper far,
 shotgun close), and obey exactly the same physics and raycast rules as humans.
 

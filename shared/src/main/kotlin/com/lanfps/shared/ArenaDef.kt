@@ -38,6 +38,29 @@ class SpawnPoint(
 )
 
 /**
+ * P4-4: a launch pad. Any body standing (or landing) inside the circle gets
+ * its vertical velocity set to [impulseY], so jumping is optional — walk over
+ * it and you fly. Pure geometry: collision/resolution code does not see it.
+ */
+class JumpPad(
+    @JvmField val x: Float,
+    @JvmField val z: Float,
+    /** Trigger circle radius on the XZ plane, metres. */
+    @JvmField val radius: Float = 1.6f,
+    /** Vertical velocity handed to the body, m/s. ~10.5 lifts ~2.7 m. */
+    @JvmField val impulseY: Float = 10.5f,
+)
+
+/**
+ * P4-5: where a pickup cube sits in the world (GrenadeState/PickupState run
+ * the live state; this is just the planted marker from the map file).
+ */
+class PickupSpawn(
+    @JvmField val kind: PickupKind,
+    @JvmField val position: Vec3,
+)
+
+/**
  * Immutable arena description shared by the server (simulation) and the client
  * (rendering + prediction).
  *
@@ -55,6 +78,10 @@ class ArenaDef(
     @JvmField val brushes: List<Brush>,
     @JvmField val spawns: List<SpawnPoint>,
     @JvmField val waypoints: List<Vec3>,
+    /** P4-4: launch pads. Empty in older maps. */
+    @JvmField val jumpPads: List<JumpPad> = emptyList(),
+    /** P4-5: pickup slots. Empty in older maps. */
+    @JvmField val pickupSpawns: List<PickupSpawn> = emptyList(),
 ) {
     /** Only the solid brushes — the list physics and raycasts iterate. */
     @JvmField
@@ -87,6 +114,15 @@ class ArenaDef(
         for (s in spawns) {
             mixF(s.position.x); mixF(s.position.y); mixF(s.position.z)
             mixF(s.yaw); mix(s.team.wire)
+        }
+        // P4: pads and pickups are part of the geometry fingerprint too —
+        // a map that gained a launch pad must not pass for the old version.
+        for (p in jumpPads) {
+            mixF(p.x); mixF(p.z); mixF(p.radius); mixF(p.impulseY)
+        }
+        for (s in pickupSpawns) {
+            mix(s.kind.wire)
+            mixF(s.position.x); mixF(s.position.y); mixF(s.position.z)
         }
         return h
     }
@@ -139,6 +175,33 @@ class ArenaDef(
             sb.append("\n")
         }
         sb.append("  ],\n")
+
+        if (jumpPads.isNotEmpty()) {
+            sb.append("  \"jumppads\": [\n")
+            for ((i, pd) in jumpPads.withIndex()) {
+                sb.append("    { \"pos\": [").append(f(pd.x)).append(", ")
+                    .append(f(0f)).append(", ").append(f(pd.z)).append("]")
+                    .append(", \"radius\": ").append(f(pd.radius))
+                    .append(", \"impulse\": ").append(f(pd.impulseY))
+                    .append(" }")
+                if (i < jumpPads.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("  ],\n")
+        }
+
+        if (pickupSpawns.isNotEmpty()) {
+            sb.append("  \"pickups\": [\n")
+            for ((i, ps) in pickupSpawns.withIndex()) {
+                sb.append("    { \"kind\": \"").append(ps.kind.name.lowercase()).append("\"")
+                    .append(", \"pos\": [").append(f(ps.position.x)).append(", ")
+                    .append(f(ps.position.y)).append(", ").append(f(ps.position.z)).append("]")
+                    .append(" }")
+                if (i < pickupSpawns.size - 1) sb.append(",")
+                sb.append("\n")
+            }
+            sb.append("  ],\n")
+        }
 
         sb.append("  \"waypoints\": [\n")
         for ((i, w) in waypoints.withIndex()) {
@@ -315,12 +378,35 @@ class ArenaDef(
                 Vec3(MiniJson.float(a[0]), MiniJson.float(a[1]), MiniJson.float(a[2]))
             } ?: emptyList()
 
+            // P4-4: launch pads and P4-5: pickup slots. Both optional — older
+            // arenas simply have none and the game plays exactly as before.
+            val jumpPads = (root["jumppads"] as? List<*>)?.map { raw ->
+                val o = MiniJson.asObject(raw)
+                val pos = MiniJson.asArray(o["pos"])
+                JumpPad(
+                    x = MiniJson.float(pos[0]),
+                    z = MiniJson.float(pos[2]),
+                    radius = o["radius"]?.let { MiniJson.float(it) } ?: 1.6f,
+                    impulseY = o["impulse"]?.let { MiniJson.float(it) } ?: 10.5f,
+                )
+            } ?: emptyList()
+
+            val pickupSpawns = (root["pickups"] as? List<*>)?.mapNotNull { raw ->
+                val o = MiniJson.asObject(raw)
+                val kind = PickupKind.fromName(o["kind"] as? String ?: "") ?: return@mapNotNull null
+                val pos = MiniJson.asArray(o["pos"])
+                PickupSpawn(
+                    kind = kind,
+                    position = Vec3(MiniJson.float(pos[0]), MiniJson.float(pos[1]), MiniJson.float(pos[2])),
+                )
+            } ?: emptyList()
+
             require(brushes.isNotEmpty()) { "arena has no brushes" }
             require(spawns.isNotEmpty()) { "arena has no spawn points" }
 
             return ArenaDef(
                 name, minX, maxX, minZ, maxZ, wallHeight,
-                brushes, spawns, waypoints,
+                brushes, spawns, waypoints, jumpPads, pickupSpawns,
             )
         }
     }

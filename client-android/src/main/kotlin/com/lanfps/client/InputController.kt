@@ -29,6 +29,9 @@ class InputController {
     /** P2-2: a reload tap, consumed by the next [sample]. */
     @Volatile var reloadQueued: Boolean = false
 
+    /** P4-6: a grenade toss, consumed by the next [sample] (edge-triggered). */
+    @Volatile var grenadeQueued: Boolean = false
+
     /** P2-1: weapon the player has selected with the WPN button. */
     @Volatile var currentWeapon: Int = Weapons.DEFAULT
 
@@ -81,6 +84,7 @@ class InputController {
         crouching = false
         jumpQueued = false
         reloadQueued = false
+        grenadeQueued = false
     }
 
     /**
@@ -125,6 +129,10 @@ class InputController {
             buttons = buttons or InputButtons.RELOAD
             // Same one-tap-one-tick rule as jump.
             reloadQueued = false
+        }
+        if (grenadeQueued) {
+            buttons = buttons or InputButtons.GRENADE
+            grenadeQueued = false
         }
         out.buttons = buttons
         out.weapon = currentWeapon

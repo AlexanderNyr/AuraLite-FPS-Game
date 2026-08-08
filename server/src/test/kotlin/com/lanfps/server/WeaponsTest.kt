@@ -283,7 +283,7 @@ class WeaponsTest {
 
     @Test
     fun `weapon catalogue is well formed`() {
-        assertEquals(Weapons.COUNT, 3)
+        assertEquals(Weapons.COUNT, 4)
         for (id in 0 until Weapons.COUNT) {
             assertTrue(Weapons.isValid(id))
             val def = Weapons.byId(id)

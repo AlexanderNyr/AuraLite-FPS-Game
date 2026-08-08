@@ -6,6 +6,9 @@ import android.opengl.Matrix
 import com.lanfps.shared.ArenaDef
 import com.lanfps.shared.EntityState
 import com.lanfps.shared.EntityType
+import com.lanfps.shared.GrenadeState
+import com.lanfps.shared.PickupKind
+import com.lanfps.shared.PickupState
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.Material
@@ -82,6 +85,14 @@ class GameRenderer(
     /** One mesh per material id, so each can bind its own texture. */
     private val materialMeshes = HashMap<Int, Mesh>(6)
     private val spawnMesh = Mesh(hasNormals = true)
+    // P4 content visuals: pads (static ring per arena), pickup cube +
+    // grenade ball (reused meshes drawn per item), plus client-side blast
+    // detection that turns a vanishing grenade into particles and sound.
+    private val padMesh = Mesh(hasNormals = true)
+    private val pickupCube = Mesh(hasNormals = true)
+    private val grenodeMesh = Mesh(hasNormals = true)
+    private val prevGrenades = HashMap<Int, FloatArray>(8)
+    private var pickupYaw = 0f
     // The avatar split so legs can swing while the upper body leans: body mesh
     // holds torso/shoulders/head/rifle; leg mesh is ONE leg with its origin at
     // the hip so a single rotateM in world space swings it like a pendulum.
@@ -413,6 +424,25 @@ class GameRenderer(
         spawnMesh.draw()
         lit.setFloat("uEmissive", 0.0f)
 
+        // P4 content trio, drawn only while we're actually in a match world:
+        // powered pads with a breathing pulse, spinning pickup cubes and the
+        // in-flight grenades. Menu/backdrop views keep the scene calm.
+        if (playing) {
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
+            lit.setFloat("uTexGain", 1.0f)
+            lit.setVec3("uTint", 1f, 1f, 1f)
+
+            // Pads: static ring, breathing emissive like the spawn strips.
+            if (padMesh.vertexCount > 0) {
+                lit.setFloat("uEmissive", 0.30f + 0.22f * sin(timeSec * 3.1f).coerceAtLeast(0f))
+                padMesh.draw()
+                lit.setFloat("uEmissive", 0.0f)
+            }
+
+            drawPickups(lit, playing, dt)
+            drawGrenades(lit, nowMs)
+        }
+
         // ---- players --------------------------------------------------------
         // P2-5: the body we are spectating must BE drawn - first-person for
         // ourselves, third-person view of our killer, so skip whoever the
@@ -719,6 +749,105 @@ class GameRenderer(
 
     // --------------------------------------------------------------- drawing
 
+    // ---- P4 worlds: pickups, grenades and their blasts ------------------
+
+    /**
+     * Draws every live pickup as a slowly spinning, hovering glow cube tinted
+     * by kind. The list travels fully with each snapshot — no interpolation:
+     * the markers are static except for spin/bob, done client-side.
+     */
+    private fun drawPickups(lit: ShaderProgram, playing: Boolean, dt: Float) {
+        val snap = state.snapshots.latest ?: return
+        val pickups = snap.pickups
+        if (pickups.isEmpty()) return
+        pickupYaw += dt * 70f
+
+        lit.setMatrix("uModel", identity)
+        var any = false
+        for (p in pickups) {
+            if (!p.active) continue
+            any = true
+            val (r, g, b) = pickupTint(p.kind)
+            lit.setVec3("uTint", r, g, b)
+            lit.setFloat("uEmissive", 0.48f + 0.16f * sin(timeSec * 3.6f + p.x).toFloat())
+
+            val bob = 0.42f + 0.09f * sin(timeSec * 2.1f + p.z).toFloat()
+            Matrix.setIdentityM(model, 0)
+            Matrix.translateM(model, 0, p.x, (p.y + bob), p.z)
+            Matrix.rotateM(model, 0, pickupYaw, 0f, 1f, 0f)
+            lit.setMatrix("uModel", model)
+            pickupCube.draw()
+        }
+        if (any) {
+            lit.setFloat("uEmissive", 0.0f)
+            lit.setVec3("uTint", 1f, 1f, 1f)
+            lit.setMatrix("uModel", identity)
+        }
+    }
+
+    private fun pickupTint(kindWire: Int): Triple<Float, Float, Float> {
+        return when (PickupKind.fromWire(kindWire)) {
+            PickupKind.HEALTH -> Triple(0.34f, 0.90f, 0.46f)
+            PickupKind.ARMOR -> Triple(0.32f, 0.66f, 0.98f)
+            PickupKind.SMG -> Triple(0.98f, 0.80f, 0.30f)
+            PickupKind.GRENADES -> Triple(0.98f, 0.58f, 0.26f)
+            null -> Triple(0.7f, 0.7f, 0.7f)
+        }
+    }
+
+    /**
+     * Draws the live grenades and turns every grenade that *vanished* since the
+     * last frame into a blast: particles + an engine shove of a boom sound.
+     * 30 Hz positions suffice to track the arc; the explosion point is the
+     * last place the ball was seen, matching where it actually went off.
+     */
+    private fun drawGrenades(lit: ShaderProgram, nowMs: Long) {
+        val snap = state.snapshots.latest
+        val list = snap?.grenades ?: emptyList<GrenadeState>()
+
+        // Fat acorn: dark body; fuse nearing its end blinks a fast hot warn.
+        for (g in list) {
+            val blink = g.fuseTicks > 30 && ((nowMs / 90L) and 1L) == 0L
+            if (blink) {
+                lit.setVec3("uTint", 0.85f, 0.22f, 0.12f)
+                lit.setFloat("uEmissive", 0.9f)
+            } else {
+                lit.setVec3("uTint", 0.16f, 0.16f, 0.18f)
+                lit.setFloat("uEmissive", 0.12f)
+            }
+            Matrix.setIdentityM(model, 0)
+            Matrix.translateM(model, 0, g.x, g.y, g.z)
+            lit.setMatrix("uModel", model)
+            grenodeMesh.draw()
+
+            val slot = prevGrenades.getOrPut(g.id) { FloatArray(3) }
+            slot[0] = g.x; slot[1] = g.y; slot[2] = g.z
+        }
+        lit.setFloat("uEmissive", 0.0f)
+        lit.setVec3("uTint", 1f, 1f, 1f)
+        lit.setMatrix("uModel", identity)
+
+        // Vanished ids => boom right there (server already did the damage).
+        if (prevGrenades.isNotEmpty()) {
+            val iter = prevGrenades.entries.iterator()
+            while (iter.hasNext()) {
+                val (id, pos) = iter.next()
+                var alive = false
+                for (g in list) if (g.id == id) { alive = true; break }
+                if (!alive) {
+                    iter.remove()
+                    particles.explosion(pos[0], pos[1], pos[2])
+                    val ddx = pos[0] - camera.x
+                    val ddz = pos[2] - camera.z
+                    val dist = kotlin.math.sqrt(ddx * ddx + ddz * ddz)
+                    val vol = (1f - dist / 60f).coerceIn(0f, 1f)
+                    if (vol > 0.03f) SoundManager.explosion(vol)
+                }
+            }
+        }
+    }
+
+
     /**
      * Pre-health team palette for an entity — shared by the body renderer
      * (which then darkens it by hp) and the death shard burst.
@@ -853,6 +982,11 @@ class GameRenderer(
             Weapons.SNIPER -> {
                 tintR = 0.82f; tintG = 0.95f; tintB = 1.12f
                 scaleX = 0.90f; scaleY = 0.90f; scaleZ = 1.32f
+            }
+            // P4-1: compact high-rate body; cool forest-green tint.
+            Weapons.SMG -> {
+                tintR = 0.88f; tintG = 1.06f; tintB = 0.86f
+                scaleX = 0.92f; scaleY = 0.92f; scaleZ = 0.80f
             }
         }
 
@@ -1051,9 +1185,46 @@ class GameRenderer(
             )
         }
         spawnMesh.upload(sb.raw(), sb.floatCount)
+
+        // P4-4: jump pads — a dodecagon ring of glowing wedge bricks. Static
+        // geometry, bright vertex colours: with the uEmissive pulse hook they
+        // read as powered launch tiles even before bloom sees them.
+        val pb = MeshBuilder(withNormals = true, initialCapacity = 4096)
+        for (pad in arena.jumpPads) {
+            buildPadRing(pb, pad.x, pad.z, pad.radius)
+        }
+        padMesh.upload(pb.raw(), pb.floatCount)
+        prevGrenades.clear() // a new map invalidates blast tracking
         AndroidLog.i(
             "arena mesh: ${materialMeshes.values.sumOf { it.vertexCount }} verts " +
                 "in ${materialMeshes.size} material meshes + spawn strips",
+        )
+    }
+
+    /** 12 wedge-ish bricks forming one glowing launch ring around a pad. */
+    private fun buildPadRing(b: MeshBuilder, cx: Float, cz: Float, radius: Float) {
+        val n = 12
+        for (i in 0 until n) {
+            val a0 = i * (2f * Math.PI.toFloat()) / n
+            val a1 = (i + 1) * (2f * Math.PI.toFloat()) / n
+            val x0 = cx + cos(a0) * radius
+            val z0 = cz + sin(a0) * radius
+            val x1 = cx + cos(a1) * radius
+            val z1 = cz + sin(a1) * radius
+            // Chunky warm slab between the two arc points; thickness scales
+            // with the ring so impulse-12 pads don't dwarf the 1.6 default.
+            val thick = (radius * 2f * Math.PI.toFloat() / n) * 0.62f
+            val xA = minOf(x0, x1) - thick * 0.18f
+            val xB = maxOf(x0, x1) + thick * 0.18f
+            val zA = minOf(z0, z1) - thick * 0.18f
+            val zB = maxOf(z0, z1) + thick * 0.18f
+            b.box(xA, 0.001f, zA, xB, 0.16f, zB, 1.0f, 0.62f, 0.22f)
+        }
+        // Centre plate: the actual pad face, dimmer than the ring.
+        b.box(
+            cx - radius * 0.55f, 0.0f, cz - radius * 0.55f,
+            cx + radius * 0.55f, 0.10f, cz + radius * 0.55f,
+            0.30f, 0.22f, 0.14f,
         )
     }
 
@@ -1087,12 +1258,29 @@ class GameRenderer(
         body.box(0.19f, 1.19f, -0.34f, 0.27f, 1.26f, -0.14f, 0.18f, 0.18f, 0.20f)
         playerBodyMesh.upload(body.raw(), body.floatCount)
 
+        buildContentPackMeshes()
+
         // ONE leg with the hip at the origin hanging down -Y: a rotation around
         // the X axis in world space swings it like a pendulum. Drawn twice, one
         // per hip offset, in opposite phase.
         val leg = MeshBuilder(withNormals = true, initialCapacity = 1024)
         leg.box(-0.075f, -0.84f, -0.115f, 0.015f, 0f, 0.035f, 0.68f, 0.68f, 0.72f)
         playerLegMesh.upload(leg.raw(), leg.floatCount)
+    }
+
+    /**
+     * Reusable unit geometry for the P4 set: a 0.34 m pickup cube (tinted per
+     * kind at draw time) and a 0.16 m dark grenade ball. Colours here are
+     * neutral multipliers — uTint does the real work.
+     */
+    private fun buildContentPackMeshes() {
+        val cube = MeshBuilder(withNormals = true, initialCapacity = 512)
+        cube.box(-0.17f, -0.17f, -0.17f, 0.17f, 0.17f, 0.17f, 1f, 1f, 1f)
+        pickupCube.upload(cube.raw(), cube.floatCount)
+
+        val ball = MeshBuilder(withNormals = true, initialCapacity = 512)
+        ball.box(-0.08f, -0.08f, -0.08f, 0.08f, 0.08f, 0.08f, 1f, 1f, 1f)
+        grenodeMesh.upload(ball.raw(), ball.floatCount)
     }
 
     /** First-person weapon, modelled in view space (-Z points where you aim). */
@@ -1136,6 +1324,9 @@ class GameRenderer(
         for (mesh in materialMeshes.values) mesh.dispose()
         materialMeshes.clear()
         spawnMesh.dispose()
+        padMesh.dispose()
+        pickupCube.dispose()
+        grenodeMesh.dispose()
         skyMesh.dispose()
         playerBodyMesh.dispose()
         playerLegMesh.dispose()

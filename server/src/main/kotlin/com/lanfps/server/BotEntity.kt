@@ -19,6 +19,12 @@ enum class BotState {
     /** Hurt: back away from the threat while still facing it. */
     EVADE,
 
+    /** P4-6/7: no enemy around — head for a useful pickup. */
+    GET_PICKUP,
+
+    /** P4-7: seen a far enemy — circle to a side angle before closing in. */
+    FLANK,
+
     /** Dead, counting down to respawn. */
     RESPAWN_WAIT,
 }
@@ -73,6 +79,12 @@ class BotEntity(id: Int, botName: String) : GameEntity(id) {
     /** P2-4: waypoint the bot is currently hiding behind while EVADE-ing. */
     @JvmField var coverWaypoint: Int = -1
 
+    /** P4-7: active pickup slot the bot is travelling to (GET_PICKUP), -1 none. */
+    @JvmField var pickupIndex: Int = -1
+
+    /** P4-7: side-angle waypoint the bot is circling to (FLANK), -1 none. */
+    @JvmField var flankWaypoint: Int = -1
+
     /** Slowly drifting aim error, refreshed by [aimErrorTimer]. */
     @JvmField var aimErrorYaw: Float = 0f
     @JvmField var aimErrorPitch: Float = 0f
@@ -88,6 +100,8 @@ class BotEntity(id: Int, botName: String) : GameEntity(id) {
         stuckTimer = 0f
         reactionTimer = 0f
         coverWaypoint = -1
+        pickupIndex = -1
+        flankWaypoint = -1
         lastPosition.set(spawn.position)
         input.clear()
         input.yaw = spawn.yaw

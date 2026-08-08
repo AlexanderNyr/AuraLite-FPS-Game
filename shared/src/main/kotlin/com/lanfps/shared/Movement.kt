@@ -133,6 +133,24 @@ class MovementSolver {
         moveZ(s, arena, s.velocity.z * dt)
         moveY(s, arena, s.velocity.y * dt)
 
+        // P4-4: launch pads. Checked after collision so the body is already
+        // resting on the pad's surface; the impulse sets a deterministic
+        // vertical velocity, so client prediction and the authoritative
+        // server take off in the exact same tick. Horizontal speed is yours
+        // to keep — flying in with momentum feels right.
+        if (s.onGround && arena.jumpPads.isNotEmpty()) {
+            for (i in arena.jumpPads.indices) {
+                val pad = arena.jumpPads[i]
+                val dx = s.position.x - pad.x
+                val dz = s.position.z - pad.z
+                if (dx * dx + dz * dz <= pad.radius * pad.radius && s.position.y < 0.6f) {
+                    s.velocity.y = pad.impulseY
+                    s.onGround = false
+                    break
+                }
+            }
+        }
+
         clampToBounds(s, arena)
     }
 

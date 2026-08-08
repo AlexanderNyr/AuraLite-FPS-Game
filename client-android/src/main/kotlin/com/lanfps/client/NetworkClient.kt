@@ -349,6 +349,7 @@ class NetworkClient(
         var lastSnapCountAt = System.currentTimeMillis()
         var lastSnapCount = 0
         var nextFireAt = 0L
+        var lastPadCueMs = 0L
 
         while (running.get() && !wantDisconnect.get()) {
             val nowNanos = System.nanoTime()
@@ -412,6 +413,15 @@ class NetworkClient(
             // so a burst of them reads as one smooth re-join, not teleport spam.
             pred?.decayError(GameConstants.TICK_DT, rttMs.toFloat())
             publishLocalTransform(pred, cmd)
+
+            // P4-4: a jump pad shove is a prediction-true vertical impulse far
+            // larger than any jump (6.6 m/s); cue the whoosh, throttled.
+            if (playing && state.alive && pred != null && pred.initialised &&
+                pred.body.velocity.y > 8f && now - lastPadCueMs > 400
+            ) {
+                lastPadCueMs = now
+                SoundManager.jumpPad()
+            }
 
             // ---- predicted muzzle flash / tracer -----------------------------
             if (playing && state.alive && cmd.firePressed && now >= nextFireAt) {
@@ -763,6 +773,9 @@ class NetworkClient(
         // rounds are left in it; the HUD and viewmodel just mirror it.
         state.localWeapon = me.weapon
         state.localAmmo = me.ammo
+        // P4: armor pool and grenade pouch mirror straight from the server.
+        state.localArmor = me.armor
+        state.localGrenades = me.grenades
 
         if (me.health < oldHealth && me.alive) {
             state.damageFlashUntilMs = now + 260
@@ -899,6 +912,14 @@ class NetworkClient(
                     listener.onMatchStateChanged(MatchState.ENDED, ev.extra)
                 }
 
+                MatchEventType.PICKUP -> {
+                    // P4-5: a pickup was consumed. Our own grabs get the bright
+                    // chime; other people's grabs would be pure noise, skip them.
+                    if (ev.killerId == state.localPlayerId) {
+                        SoundManager.pickup()
+                        AndroidLog.d("picked up kind=${ev.extra}")
+                    }
+                }
                 MatchEventType.PLAYER_JOINED -> AndroidLog.d("player joined: ${ev.killerName}")
                 MatchEventType.PLAYER_LEFT -> AndroidLog.d("player left: ${ev.killerName}")
             }

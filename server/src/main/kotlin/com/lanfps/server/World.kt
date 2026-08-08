@@ -4,6 +4,7 @@ import com.lanfps.shared.ArenaDef
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.InputCommand
+import com.lanfps.shared.InputButtons
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.Team
 import com.lanfps.shared.Weapons
@@ -58,6 +59,15 @@ class World(
     /** P1-1: past entity positions so a shot can be rewound to what the shooter
      *  actually saw (lag compensation). */
     @JvmField val history: PositionHistory = PositionHistory()
+
+    /** P4-5: live pickup slots for the current arena (never null). */
+    @JvmField val pickups: PickupManager = PickupManager(this)
+
+    /** P4-6: live grenades in flight. */
+    @JvmField val grenades: GrenadeTracker = GrenadeTracker(this)
+
+    /** Drained by [MatchController] each tick -> MATCH_EVENT(PICKUP). */
+    @JvmField val pickupFeed: ArrayList<PickupEvent> = ArrayList()
 
     private var botAI: BotAI = BotAI(this, serverArena)
 
@@ -226,6 +236,10 @@ class World(
             if (e.respawnTimer <= 0f) respawn(e)
         }
 
+        // 4) P4 systems: pickups respawn/get consumed, grenades fly/boom.
+        pickups.tick(dt, entities.values)
+        grenades.tick(dt)
+
         // P1-1: record this tick's positions for lag compensation. Done at the
         // very end so history always reflects a completed tick.
         history.record(entities.values)
@@ -235,7 +249,17 @@ class World(
 
     /** Applies weapon-switch and reload requests from one input command. */
     private fun applyWeaponIntent(e: GameEntity, cmd: InputCommand) {
-        if (Weapons.isValid(cmd.weapon) && cmd.weapon != e.weapon) {
+        // P4-6: GRENADE is a rising-edge button: one throw per press, server
+        // owns the pouch. It costs nothing while dead or grenade-less.
+        val grenadeNow = (cmd.buttons and InputButtons.GRENADE) != 0
+        if (grenadeNow && !e.prevGrenadePressed) throwGrenade(e)
+        e.prevGrenadePressed = grenadeNow
+
+        // P4-2 (instagib): nobody chooses a weapon — everybody holds the rail.
+        if (mode == GameMode.INSTAGIB) {
+            e.weapon = Weapons.SNIPER
+            if (e.ammoInMag != Weapons.AMMO_INFINITE) e.ammoInMag = Weapons.AMMO_INFINITE
+        } else if (Weapons.isValid(cmd.weapon) && cmd.weapon != e.weapon) {
             e.weapon = cmd.weapon
             // Arcade-style switch: a fresh magazine, no pending reload, and a
             // short draw time so swapping mid-fight is a small commitment.
@@ -248,6 +272,19 @@ class World(
             e.fireCooldown = maxOf(e.fireCooldown, WEAPON_SWITCH_SECONDS)
         }
         if (cmd.reloadPressed) startReload(e)
+    }
+
+    /**
+     * P4-6: tosses one grenade from [e], pouch-permitting. Public so both the
+     * input path (rising edge above) and tests/SQL tooling share one definition
+     * of "can this entity throw right now".
+     * @returns true when a grenade actually left the hand.
+     */
+    fun throwGrenade(e: GameEntity): Boolean {
+        if (!e.alive || !combatEnabled || e.grenades <= 0) return false
+        e.grenades--
+        grenades.throwFrom(e)
+        return true
     }
 
     /** Begins a reload when it makes sense. No-op with infinite ammo. */
@@ -281,7 +318,11 @@ class World(
         if (!combatEnabled) return
         if (!firePressed || !shooter.alive) return
 
-        val def = Weapons.byId(shooter.weapon)
+        val def = if (mode == GameMode.INSTAGIB) {
+            Weapons.InstagibDef
+        } else {
+            Weapons.byId(shooter.weapon)
+        }
         // Empty chamber: kick off the reload right away, even if the previous
         // shot's cooldown is still draining — the timers run in parallel and
         // [updateWeaponTimers] would do it next tick anyway.
@@ -325,7 +366,15 @@ class World(
 
     fun applyDamage(victim: GameEntity, attacker: GameEntity, amount: Int) {
         if (!victim.alive) return
-        victim.health -= amount
+        // P4-5: armor soaks two thirds of every chunk until empty; the rest
+        // always bleeds into health, so armor delays but never replaces death.
+        var remaining = amount
+        if (victim.armor > 0) {
+            val absorbed = minOf(victim.armor, (amount * 2 + 1) / 3)
+            victim.armor -= absorbed
+            remaining = amount - absorbed
+        }
+        victim.health -= remaining
         victim.lastAttackerId = attacker.id
 
         if (victim.health > 0) return
@@ -343,6 +392,11 @@ class World(
         val spawn = serverArena.pickSpawn(entity.team, enemiesOf(entity))
         entity.spawnAt(spawn)
         if (config.infiniteAmmo) entity.ammoInMag = Weapons.AMMO_INFINITE
+        // P4-2: instagib hands everyone the rail, always.
+        if (mode == GameMode.INSTAGIB) {
+            entity.weapon = Weapons.SNIPER
+            entity.ammoInMag = Weapons.AMMO_INFINITE
+        }
     }
 
     /**
@@ -356,6 +410,8 @@ class World(
         raycast = ServerRaycast(def)
         botAI = BotAI(this, serverArena)
         history.clear()
+        pickups.setArena()
+        grenades.grenades.clear()
         for (e in entities.values) respawn(e)
         Log.info("arena switched -> ${def.describe()}")
         Log.info(serverArena.describeGraph())
@@ -387,6 +443,8 @@ class World(
             respawn(e)
         }
         killFeed.clear()
+        pickups.resetAll()
+        grenades.grenades.clear()
     }
 
     fun scoreSummary(): String = when {

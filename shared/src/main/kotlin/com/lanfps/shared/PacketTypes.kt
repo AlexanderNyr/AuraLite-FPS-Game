@@ -41,6 +41,9 @@ object InputButtons {
     const val JUMP: Int = 1 shl 1
     const val CROUCH: Int = 1 shl 2
     const val RELOAD: Int = 1 shl 3
+
+    /** P4-6: throw a grenade (edge-triggered, one per press). */
+    const val GRENADE: Int = 1 shl 4
 }
 
 /** MATCH_EVENT sub-types. */
@@ -50,6 +53,10 @@ object MatchEventType {
     const val MATCH_END: Int = 3
     const val PLAYER_JOINED: Int = 4
     const val PLAYER_LEFT: Int = 5
+
+    /** P4-5: a player picked up a map pickup. killerId/killerName = player,
+     *  extra = [PickupKind] wire id (client uses it for sound/flash colour). */
+    const val PICKUP: Int = 6
 }
 
 /** High-level match phase, mirrored to clients in every snapshot. */

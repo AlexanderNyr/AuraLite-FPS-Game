@@ -41,7 +41,10 @@ object Weapons {
     const val RIFLE: Int = 0
     const val SHOTGUN: Int = 1
     const val SNIPER: Int = 2
-    const val COUNT: Int = 3
+
+    /** P4-1: fourth slot — a fast, light side-grade to the rifle. */
+    const val SMG: Int = 3
+    const val COUNT: Int = 4
 
     /** Default weapon every entity spawns with (and the first id clients cycle). */
     const val DEFAULT: Int = RIFLE
@@ -76,9 +79,39 @@ object Weapons {
         range = 200f, recoilPitchDeg = 2.4f,
     )
 
+    /**
+     * P4-1: the SMG. Right between "pea shooter" and rifle: same single-pellet
+     * hitscan model as the rifle, but roughly 60% faster fire, a whisper more
+     * spread and a third less damage per round, so mid-range duels feel
+     * completely different — pressure instead of pick.
+     */
+    @JvmField
+    val SmgDef: WeaponDef = WeaponDef(
+        id = SMG, displayName = "SMG", shortName = "SMG",
+        damage = 13, pellets = 1, spreadDeg = 1.3f,
+        fireInterval = 0.075f, magazineSize = 40, reloadSeconds = 1.8f,
+        range = 100f, recoilPitchDeg = 0.32f,
+    )
+
+    /**
+     * P4-2 (INSTAGIB): the rail profile everyone is forced onto. Bottomless
+     * magazine ([Weapons.AMMO_INFINITE] as magazineSize keeps "infinite ammo"
+     * bookkeeping honest even when finite-ammo config is on) and one hit,
+     * anywhere, kills. Share the def object instead of special-casing damage in
+     * World, so tracers/recoil/HUD read the usual fields.
+     */
+    @JvmField
+    val InstagibDef: WeaponDef = WeaponDef(
+        id = SNIPER, displayName = "RAILGUN", shortName = "RAIL",
+        damage = 999, pellets = 1, spreadDeg = 0.02f,
+        fireInterval = 1.2f, magazineSize = AMMO_INFINITE, reloadSeconds = 0f,
+        range = 260f, recoilPitchDeg = 2.0f,
+    )
+
     fun byId(id: Int): WeaponDef = when (id) {
         SHOTGUN -> ShotgunDef
         SNIPER -> SniperDef
+        SMG -> SmgDef
         else -> RifleDef
     }
 

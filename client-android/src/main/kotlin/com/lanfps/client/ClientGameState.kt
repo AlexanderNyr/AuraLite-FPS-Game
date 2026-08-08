@@ -114,6 +114,12 @@ class ClientGameState(@JvmField var arena: ArenaDef) {
     /** P2-2: rounds in our magazine, or [Weapons.AMMO_INFINITE] (HUD shows ∞). */
     @Volatile var localAmmo: Int = Weapons.AMMO_INFINITE
 
+    /** P4-5: our armor pool as the server reports it (HUD bar). */
+    @Volatile var localArmor: Int = 0
+
+    /** P4-6: grenades left in our pouch (HUD counter). */
+    @Volatile var localGrenades: Int = GameConstants.START_GRENADES
+
     /** P2-5: entity to spectate while we are dead (usually our killer), -1 = off. */
     @Volatile var spectateId: Int = -1
 
@@ -346,6 +352,8 @@ class ClientGameState(@JvmField var arena: ArenaDef) {
         votesTdm = 0
         localWeapon = Weapons.DEFAULT
         localAmmo = Weapons.AMMO_INFINITE
+        localArmor = 0
+        localGrenades = GameConstants.START_GRENADES
         spectateId = -1
         lastDamageTakenMs = 0
         pendingArenaName = null

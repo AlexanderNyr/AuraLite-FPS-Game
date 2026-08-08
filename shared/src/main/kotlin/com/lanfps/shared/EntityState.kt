@@ -34,6 +34,13 @@ class EntityState {
      *  server runs with infinite ammo. Display-only for remote entities. */
     @JvmField var ammo: Int = Weapons.AMMO_INFINITE
 
+    /** P4-5: armor pool (0..[GameConstants.MAX_ARMOR]); absorbs part of the
+     *  incoming damage. Display-only for remote entities. */
+    @JvmField var armor: Int = 0
+
+    /** P4-6: grenades left in the pouch; the HUD shows ours, the rest is silent. */
+    @JvmField var grenades: Int = 0
+
     @JvmField var flags: Int = 0
 
     /**
@@ -67,6 +74,7 @@ class EntityState {
         vx = o.vx; vy = o.vy; vz = o.vz
         health = o.health; kills = o.kills; deaths = o.deaths
         weapon = o.weapon; ammo = o.ammo
+        armor = o.armor; grenades = o.grenades
         flags = o.flags; name = o.name
         return this
     }
@@ -90,6 +98,8 @@ class EntityState {
         w.writeU16(MathUtil.clamp(deaths, 0, 65535))
         w.writeU8(MathUtil.clamp(weapon, 0, 255))
         w.writeU8(MathUtil.clamp(ammo, 0, 255))
+        w.writeU8(MathUtil.clamp(armor, 0, 255))
+        w.writeU8(MathUtil.clamp(grenades, 0, 255))
         // NB: no name. See the field comment — names moved to LOBBY_STATE.
     }
 
@@ -108,6 +118,8 @@ class EntityState {
         deaths = r.readU16()
         weapon = r.readU8()
         ammo = r.readU8()
+        armor = r.readU8()
+        grenades = r.readU8()
         // NB: no name on the wire anymore (see the field comment). The client
         // fills it from the LOBBY_STATE roster.
         return this
@@ -122,8 +134,9 @@ class EntityState {
         const val FLAG_FIRING: Int = 1 shl 1
         const val FLAG_CROUCH: Int = 1 shl 2
 
-        /** Fixed part of the wire size (no nickname on the wire since P0-1). */
-        const val WIRE_SIZE_FIXED: Int = 2 + 1 + 1 + 1 + 12 + 8 + 6 + 1 + 2 + 2 + 1 + 1
+        /** Fixed part of the wire size (no nickname on the wire since P0-1).
+         *  +2 armor/grenade bytes arrived with P4. */
+        const val WIRE_SIZE_FIXED: Int = 2 + 1 + 1 + 1 + 12 + 8 + 6 + 1 + 2 + 2 + 1 + 1 + 2
 
         private fun quantiseVelocity(v: Float): Int =
             MathUtil.clamp((v * 100f).toInt(), -32768, 32767)

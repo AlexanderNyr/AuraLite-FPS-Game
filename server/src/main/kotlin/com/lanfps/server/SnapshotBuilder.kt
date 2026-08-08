@@ -29,6 +29,10 @@ class SnapshotBuilder {
     /** Pool of entity-state objects so a 30 Hz broadcast allocates nothing. */
     private val statePool = ArrayList<EntityState>()
 
+    /** P4: pooled section buffers for pickups and grenades. */
+    private val pickupPool = ArrayList<com.lanfps.shared.PickupState>()
+    private val grenadePool = ArrayList<com.lanfps.shared.GrenadeState>()
+
     private val deltaScratch = SnapshotDelta()
 
     /** Length in bytes of the datagram currently held in [buffer]. */
@@ -103,6 +107,9 @@ class SnapshotBuilder {
             copyIntoBase(st, snapshot.entities)
         }
 
+        world.pickups.snapshotTo(snapshot.pickups, pickupPool)
+        world.grenades.snapshotTo(snapshot.grenades, grenadePool)
+
         Protocol.begin(writer, com.lanfps.shared.PacketTypes.SERVER_SNAPSHOT, sequence)
         Packets.writeSnapshot(writer, snapshot)
         length = Protocol.end(writer)
@@ -151,6 +158,9 @@ class SnapshotBuilder {
             snapshot.entities.add(statePool[i])
             i++
         }
+
+        world.pickups.snapshotTo(snapshot.pickups, pickupPool)
+        world.grenades.snapshotTo(snapshot.grenades, grenadePool)
 
         Protocol.begin(writer, com.lanfps.shared.PacketTypes.SERVER_SNAPSHOT, sequence)
         Packets.writeSnapshot(writer, snapshot)

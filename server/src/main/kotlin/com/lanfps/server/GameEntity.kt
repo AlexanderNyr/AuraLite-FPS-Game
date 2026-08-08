@@ -50,6 +50,15 @@ abstract class GameEntity(@JvmField val id: Int) {
     /** >0 while a reload is in progress; counts down to the refill tick. */
     @JvmField var reloadTimer: Float = 0f
 
+    /** P4-5: armor pool; absorbs 2/3 of incoming damage until depleted. */
+    @JvmField var armor: Int = 0
+
+    /** P4-6: grenades left in the pouch. */
+    @JvmField var grenades: Int = GameConstants.START_GRENADES
+
+    /** P4-6: rising-edge memory for the GRENADE button (one throw per press). */
+    @JvmField var prevGrenadePressed: Boolean = false
+
     val reloading: Boolean get() = reloadTimer > 0f
 
     abstract val entityType: Int
@@ -74,6 +83,9 @@ abstract class GameEntity(@JvmField val id: Int) {
         fireCooldown = 0f
         firedThisTick = false
         lastAttackerId = 0
+        // P4 fields reset per respawn: you drop your armor, keep a fresh nade.
+        armor = 0
+        grenades = GameConstants.START_GRENADES
         // Weapon identity survives death; the magazine is refilled
         // (World.respawn upgrades this to AMMO_INFINITE when configured).
         ammoInMag = Weapons.byId(weapon).magazineSize
@@ -106,6 +118,8 @@ abstract class GameEntity(@JvmField val id: Int) {
         dst.deaths = deaths
         dst.weapon = weapon
         dst.ammo = ammoInMag
+        dst.armor = armor
+        dst.grenades = grenades
         dst.flags = 0
         dst.alive = alive
         dst.firing = firedThisTick

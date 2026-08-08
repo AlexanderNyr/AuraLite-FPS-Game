@@ -52,10 +52,18 @@ object SoundManager {
     /** Deep enough for a skirmish; when full, gunshots get dropped. */
     private const val QUEUE_CAPACITY = 8
 
-    /** Longest clip is death (0.40 s); the writer's scratch buffer fits any. */
-    private val MAX_CLIP_SAMPLES = (SAMPLE_RATE * 0.45f).toInt()
+    /** Longest clip is now the explosion (0.50 s); the writer's scratch fits any. */
+    private val MAX_CLIP_SAMPLES = (SAMPLE_RATE * 0.55f).toInt()
 
-    private enum class Clip { GUNSHOT, HIT, DAMAGE, DEATH, RESPAWN, MATCH_END_A, MATCH_END_B }
+    private enum class Clip {
+        GUNSHOT, HIT, DAMAGE, DEATH, RESPAWN, MATCH_END_A, MATCH_END_B,
+        /** P4-6: big boom. Lower, longer and louder than a gunshot. */
+        EXPLOSION,
+        /** P4-5: bright little pickup chime. */
+        PICKUP,
+        /** P4-4: whoosh up for a jump pad launch. */
+        JUMPPAD,
+    }
 
     private class Request(
         @JvmField val clip: Clip,
@@ -90,6 +98,9 @@ object SoundManager {
                         clipCache[Clip.RESPAWN] = tone(0.25f, 180f, 520f, 0.22f)
                         clipCache[Clip.MATCH_END_A] = tone(0.12f, 660f, 660f, 0.22f)
                         clipCache[Clip.MATCH_END_B] = tone(0.20f, 880f, 880f, 0.22f)
+                        clipCache[Clip.EXPLOSION] = noiseBurst(0.50f, 11f)
+                        clipCache[Clip.PICKUP] = tone(0.16f, 520f, 980f, 0.24f)
+                        clipCache[Clip.JUMPPAD] = tone(0.22f, 200f, 720f, 0.26f)
                         cacheReady = true
                     } catch (_: Exception) {
                         return null // audio init failed: stay silent
@@ -109,6 +120,9 @@ object SoundManager {
     fun damage(volume: Float = 1f) = enqueue(Clip.DAMAGE, volume * 0.7f, droppable = false)
     fun death(volume: Float = 1f) = enqueue(Clip.DEATH, volume * 0.8f, droppable = false)
     fun respawn(volume: Float = 1f) = enqueue(Clip.RESPAWN, volume * 0.6f, droppable = false)
+    fun explosion(volume: Float = 1f) = enqueue(Clip.EXPLOSION, volume * 0.9f, droppable = true)
+    fun pickup(volume: Float = 1f) = enqueue(Clip.PICKUP, volume * 0.6f, droppable = false)
+    fun jumpPad(volume: Float = 1f) = enqueue(Clip.JUMPPAD, volume * 0.7f, droppable = true)
 
     fun matchEnd(volume: Float = 1f) {
         enqueue(Clip.MATCH_END_A, volume * 0.6f, droppable = false)

@@ -2,6 +2,7 @@ package com.lanfps.server
 
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.InputButtons
+import com.lanfps.shared.PickupKind
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.Vec3
 import com.lanfps.shared.Weapons
@@ -73,6 +74,8 @@ class BotAI(
             BotState.EVADE -> actEvade(bot, target, dt)
             BotState.SEEK_TARGET -> actSeek(bot, dt)
             BotState.PATROL -> actPatrol(bot, dt)
+            BotState.GET_PICKUP -> actGetPickup(bot, dt)
+            BotState.FLANK -> actFlank(bot, target, dt)
             BotState.RESPAWN_WAIT -> { /* nothing */ }
         }
 
@@ -143,7 +146,9 @@ class BotAI(
                 }
             } else {
                 bot.hasLastKnown = false
-                bot.setState(BotState.PATROL)
+                // Getting a pickup is a solo mission: losing a stale trail
+                // while travelling to one does NOT cancel the errand.
+                if (bot.state != BotState.GET_PICKUP) bot.setState(BotState.PATROL)
             }
         }
     }
@@ -157,6 +162,25 @@ class BotAI(
         aimAt(bot, targetEye, dt)
 
         val dist = bot.body.position.distanceTo(target.body.position)
+
+        // P4-7: far enemies are circled from the side instead of walked into
+        // face-first, about once in a blue moon so it reads as intent.
+        if (dist > FLANK_MIN_RANGE && rng.nextFloat() < dt * FLANK_CHANCE_PER_SEC) {
+            val flank = findFlankWaypoint(bot, target)
+            if (flank >= 0) {
+                bot.flankWaypoint = flank
+                bot.setState(BotState.FLANK)
+                return
+            }
+        }
+
+        // P4-6: a grenade arcs in when we have them and the range is juicy.
+        // Deliberately rare: every bot being a nade turret would drown the map.
+        if (bot.grenades > 0 && dist in GRENADE_MIN_RANGE..GRENADE_MAX_RANGE &&
+            bot.reactionTimer <= 0f && rng.nextFloat() < dt * GRENADE_CHANCE_PER_SEC
+        ) {
+            bot.input.buttons = bot.input.buttons or InputButtons.GRENADE
+        }
 
         // P2-1: pick the right tool for the range.
         bot.input.weapon = weaponForRange(dist)
@@ -254,8 +278,142 @@ class BotAI(
         applyMove(bot, 1f, 0f)
     }
 
+    /**
+     * P4-7 pickup run: travel to the chosen slot; the [PickupManager] consumes
+     * it the instant we step on it. Slots that vanished mid-trip or a long
+     * stale route poke us back onto patrol duty.
+     */
+    private fun actGetPickup(bot: BotEntity, dt: Float) {
+        val slots = world.pickups.slots
+        if (bot.pickupIndex !in slots.indices || !slots[bot.pickupIndex].active) {
+            bot.setState(BotState.PATROL)
+            return
+        }
+        if (bot.stateTimer > GET_PICKUP_TIMEOUT) {
+            bot.pickupIndex = -1
+            bot.setState(BotState.PATROL)
+            return
+        }
+        val slot = slots[bot.pickupIndex]
+        navigateCheatDestination.set(slot.x, slot.y, slot.z)
+        // Close enough? The trigger will fire on contact; arrive -> patrol.
+        if (bot.body.position.horizontalDistanceTo(navigateCheatDestination) < 1.2f) {
+            bot.pickupIndex = -1
+            bot.setState(BotState.PATROL)
+            return
+        }
+        navigateTowards(bot, navigateCheatDestination, dt)
+        applyMove(bot, 1f, 0f)
+    }
+
+    /** Scratch world target for the pickup navigation call (no allocation). */
+    private val navigateCheatDestination = com.lanfps.shared.Vec3()
+
+    /**
+     * P4-7: circling to a side angle before engaging — the bot keeps walking
+     * the flank route with its aim on the enemy, then slides into SEEK for
+     * the actual approach.
+     */
+    private fun actFlank(bot: BotEntity, target: GameEntity?, dt: Float) {
+        if (target == null || bot.flankWaypoint < 0 ||
+            bot.flankWaypoint >= arena.waypointCount
+        ) {
+            bot.flankWaypoint = -1
+            bot.setState(BotState.SEEK_TARGET)
+            return
+        }
+        target.eyePosition(targetEye)
+        aimAt(bot, targetEye, dt)
+
+        val here = arena.waypoint(bot.flankWaypoint)
+        if (bot.body.position.horizontalDistanceTo(here) < WAYPOINT_REACHED ||
+            bot.stateTimer > FLANK_TIMEOUT
+        ) {
+            bot.flankWaypoint = -1
+            bot.setState(BotState.SEEK_TARGET)
+            return
+        }
+        navigateTowards(bot, here, dt)
+        applyMove(bot, 1f, 0f)
+    }
+
+    /**
+     * P4-7: a waypoint that is close-ish to the enemy but hidden from their
+     * eyes — stepping there keeps us out of their crosshair until we are
+     * *much* closer. Returns -1 when nothing sane qualifies.
+     */
+    private fun findFlankWaypoint(bot: BotEntity, target: GameEntity): Int {
+        var best = -1
+        var bestScore = Float.MAX_VALUE
+        val from = arena.nearestWaypoint(bot.body.position)
+        for (i in 0 until arena.waypointCount) {
+            val wp = arena.waypoint(i)
+            val toTarget = wp.horizontalDistanceTo(target.body.position)
+            if (toTarget < 4f || toTarget > 18f) continue
+            tmp.set(wp.x, wp.y + 0.9f, wp.z)
+            target.eyePosition(targetEye)
+            // Routeable from us, invisible from them: the whole point.
+            if (!arena.hasRoute(from, i)) continue
+            if (world.raycast.hasLineOfSight(tmp, targetEye)) continue
+            val score = bot.body.position.horizontalDistanceTo(wp) + rng.nextFloat() * 3f
+            if (score < bestScore) {
+                bestScore = score
+                best = i
+            }
+        }
+        return best
+    }
+
+    /**
+     * P4-7: the "want a pickup" brain. Returns the slot index to run for, or
+     * -1. Needs are weighted: bleeding bots run for medkits, armoured-hungry
+     * ones for shields; grenade-rich bots skip the pouch entirely.
+     */
+    private fun pickupWanted(bot: BotEntity): Int {
+        val slots = world.pickups.slots
+        if (slots.isEmpty()) return -1
+        var best = -1
+        var bestScore = Float.MAX_VALUE
+        val from = arena.nearestWaypoint(bot.body.position)
+        for (i in slots.indices) {
+            val slot = slots[i]
+            if (!slot.active) continue
+            val desire = when (slot.kind) {
+                PickupKind.HEALTH -> if (bot.health < 75) 1.0f - bot.health / 100f else 0f
+                PickupKind.ARMOR -> if (bot.armor < 50) 0.6f else 0f
+                PickupKind.SMG -> if (bot.weapon != Weapons.SMG) 0.25f else 0f
+                PickupKind.GRENADES -> if (bot.grenades < GameConstants.MAX_GRENADES) 0.35f else 0f
+            }
+            if (desire <= 0f) continue
+            navigateCheatDestination.set(slot.x, slot.y, slot.z)
+            val to = arena.nearestWaypoint(navigateCheatDestination)
+            if (!arena.hasRoute(from, to)) continue
+            val dist = bot.body.position.horizontalDistanceTo(navigateCheatDestination)
+            if (dist > PICKUP_MAX_TRAVEL) continue
+            // High-skilled bots commit harder to pickups (they read the map).
+            val score = dist * (1.6f - desire) - bot.skill * 4f
+            if (score < bestScore) {
+                bestScore = score
+                best = i
+            }
+        }
+        return best
+    }
+
     private fun actPatrol(bot: BotEntity, dt: Float) {
         if (arena.waypointCount == 0) return
+
+        // P4-7: before the next patrol leg, check whether a pickup is worth
+        // the detour. Fresh goals only — never re-decided mid-walk (prevents
+        // goal flapping between two equidistant medkits).
+        if (bot.goalWaypoint < 0 || rng.nextFloat() < dt * 0.4f) {
+            val want = pickupWanted(bot)
+            if (want >= 0) {
+                bot.pickupIndex = want
+                bot.setState(BotState.GET_PICKUP)
+                return
+            }
+        }
 
         if (bot.goalWaypoint < 0) {
             bot.goalWaypoint = rng.nextInt(arena.waypointCount)
@@ -390,10 +548,12 @@ class BotAI(
         bot.input.moveRight = MathUtil.clamp(r, -1f, 1f)
     }
 
-    /** P2-1: arsenal by engagement range — sniper far, shotgun close, rifle mid. */
+    /** P2-1/P4-1: arsenal by engagement range — sniper far, shotgun close,
+     *  SMG in the pressure band, rifle mid-range. Instagib clamps later. */
     private fun weaponForRange(dist: Float): Int = when {
         dist >= SNIPER_MIN_RANGE -> Weapons.SNIPER
         dist <= SHOTGUN_MAX_RANGE -> Weapons.SHOTGUN
+        dist <= SMG_MAX_RANGE -> Weapons.SMG
         else -> Weapons.RIFLE
     }
 
@@ -454,8 +614,23 @@ class BotAI(
         /** P2-4: a gunshot this far away (metres) can be heard by bots. */
         private const val HEARING_RANGE = 30f
 
-        /** P2-1: range bands the bots use to pick a weapon. */
+        /** P2-1/P4-1: range bands the bots use to pick a weapon. */
         private const val SNIPER_MIN_RANGE = 24f
         private const val SHOTGUN_MAX_RANGE = 8f
+        private const val SMG_MAX_RANGE = 17f
+
+        /** P4-7: patrol side-quest to pickups. */
+        private const val GET_PICKUP_TIMEOUT = 8f
+        private const val PICKUP_MAX_TRAVEL = 32f
+
+        /** P4-7: flank manoeuvre parameters. */
+        private const val FLANK_MIN_RANGE = 16f
+        private const val FLANK_CHANCE_PER_SEC = 0.12f
+        private const val FLANK_TIMEOUT = 5f
+
+        /** P4-6: grenade behaviour. */
+        private const val GRENADE_MIN_RANGE = 7f
+        private const val GRENADE_MAX_RANGE = 22f
+        private const val GRENADE_CHANCE_PER_SEC = 0.22f
     }
 }

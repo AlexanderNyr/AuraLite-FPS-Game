@@ -39,6 +39,10 @@ class SnapshotDelta {
             if (a.yaw != b.yaw || a.pitch != b.pitch) return false
             if (a.vx != b.vx || a.vy != b.vy || a.vz != b.vz) return false
             if (a.health != b.health || a.kills != b.kills || a.deaths != b.deaths) return false
+            // P4: weapon/armor/grenade changes without a position change used to
+            // pass "unchanged" and skip the client entirely for one keyframe.
+            if (a.weapon != b.weapon || a.ammo != b.ammo) return false
+            if (a.armor != b.armor || a.grenades != b.grenades) return false
             return true
         }
 

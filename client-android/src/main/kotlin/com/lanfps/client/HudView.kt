@@ -264,6 +264,25 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
         text.color = Color.argb(170, 139, 148, 158)
         canvas.drawText("HP", left + dp(34f), bottom - barH - dp(8f), text)
 
+        // P4-5: armor bar (thin, cyan, above the health bar; hidden at zero —
+        // nothing to display is the calmest UI there is).
+        if (state.localArmor > 0) {
+            val aFrac = (state.localArmor / GameConstants.MAX_ARMOR.toFloat()).coerceIn(0f, 1f)
+            val aTop = bottom - barH - dp(22f)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.argb(150, 10, 14, 20)
+            rect.set(left, aTop - dp(7f), left + barW, aTop)
+            canvas.drawRoundRect(rect, dp(3f), dp(3f), paint)
+            paint.color = Color.argb(235, 108, 178, 232)
+            rect.set(left, aTop - dp(7f), left + barW * aFrac, aTop)
+            canvas.drawRoundRect(rect, dp(3f), dp(3f), paint)
+
+            text.textAlign = Paint.Align.LEFT
+            text.textSize = dp(12f)
+            text.color = Color.argb(220, 108, 178, 232)
+            canvas.drawText("AR ${state.localArmor}", left + barW + dp(10f), aTop - dp(1f), text)
+        }
+
         // Ammo and weapon (P2-1/P2-2): the infinity glyph when the server runs
         // with infiniteAmmo, the honest round count otherwise. An empty mag is
         // amber - the reload is already running on the server.
@@ -283,6 +302,15 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
             Weapons.byId(state.localWeapon).displayName,
             w - dp(26f), bottom - dp(58f), text,
         )
+
+        // P4-6: grenade pouch, right of the weapon name when we carry any.
+        if (state.localGrenades > 0) {
+            text.textSize = dp(13f)
+            text.color = Color.argb(210, 242, 163, 60)
+            canvas.drawText(
+                "GRN ×${state.localGrenades}", w - dp(26f), bottom - dp(40f), text,
+            )
+        }
 
         text.textAlign = Paint.Align.LEFT
         text.textSize = dp(12f)
