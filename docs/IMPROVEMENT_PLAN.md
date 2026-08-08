@@ -1,5 +1,36 @@
 # LAN FPS — improvement plan
 
+> ## STATUS (2026-08): everything in this document is implemented ✅
+>
+> The plan below is kept verbatim as the design rationale. This is where each
+> item landed (protocol is now **v3**, 124 tests, all green):
+>
+> | Item | Status | Implementation |
+> |---|---|---|
+> | P0-1 nicknames → MTU | ✅ done | names out of snapshots into `LOBBY_STATE` roster; `SNAPSHOT_MAX_BYTES=1400` enforced |
+> | P0-2 reconnect | ✅ done | `resumeToken`, zombie sessions, `Phase.RECONNECTING` (`ConnectHandshakeTest`) |
+> | P0-3 CONNECT flood | ✅ done | global + per-IP rate limits, sessions-per-IP cap, plus optional `password=` (`SessionManager`, `MatchFlowTest`) |
+> | P0-4 MTU test | ✅ done | packet-budget assertions at 1400 B |
+> | P1-1 lag compensation | ✅ done | `PositionHistory` rewind ≈90 ms + RTT/2, capped 250 ms (`LagCompensationTest`) |
+> | P1-2 delta compression | ✅ done | FULL keyframes + per-recipient DELTAs (`SnapshotDelta`, `SnapshotDeltaTest`) |
+> | P1-3 sound | ✅ done | procedural `SoundManager` (gunshot/hit/damage/death/respawn/jingle); vibration buzz on damage |
+> | P1-4 reliable events | ✅ done | `eventSeq` + header ack re-send loop |
+> | P2-1 weapons | ✅ done | `WeaponDef`/`Weapons` catalogue: RIFLE, SHOTGUN (7-pellet spread), SNIPER; WPN button; per-weapon HUD/viewmodel/tracers (`WeaponsTest`) |
+> | P2-2 ammo/reload | ✅ done | `infiniteAmmo=` config key (default false); magazines, RLD button, auto-reload of a dry gun |
+> | P2-3 maps | ✅ done | `arena02` *Crossfire* + `arena03` *Foundry*; `mapRotation=`; server announces arena in `MATCH_START`, client hot-loads + hash-verifies the asset (`MapsTest`) |
+> | P2-4 AI | ✅ done | hearing within 30 m → SEEK, EVADE runs to real cover, per-bot skill spread around `botDifficulty`; bots pick weapons by range |
+> | P2-5 spectator | ✅ done | dead players watch their killer until respawn |
+> | P2-6 mode in UI | ✅ done | mode + kill goal in the lobby and on the HUD top bar (`LOBBY_STATE.killLimit`) |
+> | P2-7 team balance | ✅ done | auto re-deal by score between matches (`World.balanceTeams`) |
+> | P3-1 lossy tests | ✅ done | `tools/ChaosProxy.kt` + `ChaosNetworkTest` (0/10/20 % loss, 60–120 ms latency, jitter, reorder) |
+> | P3-2 CI | ✅ done | `.github/workflows/ci.yml` (+ release publishing) |
+> | P3-3 metrics | ✅ done | tick p50/p95/p99 + real tps in the stats line; per-session rttP95 + uplink loss; `--statsCsv=` |
+> | P3-4 smaller things | ✅ done | `MODE_VOTE` lobby vote (strict majority, one match); R8 on with `proguard-rules.pro`; `NetworkClientTest` (8 wire-level tests); `SessionManager` split out of `GameServer`; `values-ru/`; README plainly says "dev key — do not publish" |
+>
+> ---
+>
+> # Original plan (verbatim)
+
 Written from a code audit, not from general advice: everything below was checked
 against the current tree (10,318 lines of Kotlin, 74 tests, zero TODO/FIXME
 markers in the source).

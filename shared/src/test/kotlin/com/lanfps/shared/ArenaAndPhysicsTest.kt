@@ -187,7 +187,7 @@ class ArenaAndPhysicsTest {
         )
         val origin = Vec3(-10f, GameConstants.EYE_HEIGHT, -14f)
         val dir = Vec3(1f, 0f, 0f)
-        val t = RayMath.rayAabb(origin, dir, target, GameConstants.WEAPON_RANGE)
+        val t = RayMath.rayAabb(origin, dir, target, Weapons.RifleDef.range)
         assertTrue(t > 0f, "ray should hit the target box")
         assertTrue(
             kotlin.math.abs(t - (10f - GameConstants.PLAYER_RADIUS)) < 0.05f,
@@ -204,7 +204,7 @@ class ArenaAndPhysicsTest {
         val dir = Vec3(1f, 0f, 0f)
         assertEquals(
             RayMath.NO_HIT,
-            RayMath.rayAabb(origin, dir, target, GameConstants.WEAPON_RANGE),
+            RayMath.rayAabb(origin, dir, target, Weapons.RifleDef.range),
         )
     }
 

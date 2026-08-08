@@ -4,6 +4,7 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.InputButtons
 import com.lanfps.shared.InputCommand
 import com.lanfps.shared.MathUtil
+import com.lanfps.shared.Weapons
 
 /**
  * The bridge between the touch layer (UI thread) and the network tick
@@ -24,6 +25,17 @@ class InputController {
     @Volatile var firing: Boolean = false
     @Volatile var jumpQueued: Boolean = false
     @Volatile var crouching: Boolean = false
+
+    /** P2-2: a reload tap, consumed by the next [sample]. */
+    @Volatile var reloadQueued: Boolean = false
+
+    /** P2-1: weapon the player has selected with the WPN button. */
+    @Volatile var currentWeapon: Int = Weapons.DEFAULT
+
+    /** P2-1: cycles rifle -> shotgun -> sniper -> rifle. */
+    fun cycleWeapon() {
+        currentWeapon = (currentWeapon + 1) % Weapons.COUNT
+    }
 
     // ---- view --------------------------------------------------------------
     /** Absolute view angles, owned by the client. */
@@ -68,6 +80,7 @@ class InputController {
         firing = false
         crouching = false
         jumpQueued = false
+        reloadQueued = false
     }
 
     /**
@@ -108,8 +121,13 @@ class InputController {
             // for, and can never be missed either.
             jumpQueued = false
         }
+        if (reloadQueued) {
+            buttons = buttons or InputButtons.RELOAD
+            // Same one-tap-one-tick rule as jump.
+            reloadQueued = false
+        }
         out.buttons = buttons
-        out.weapon = 0
+        out.weapon = currentWeapon
         return out.sanitize()
     }
 
@@ -121,6 +139,10 @@ class InputController {
         out.clientTimeMs = nowMs
         out.yaw = yaw
         out.pitch = pitch
+        // The weapon wish keeps travelling while dead/lobbying: the server
+        // ignores dead entities, but the selection must be waiting the moment
+        // we respawn.
+        out.weapon = currentWeapon
         return out.sanitize()
     }
 

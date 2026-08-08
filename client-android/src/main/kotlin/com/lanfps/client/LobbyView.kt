@@ -27,12 +27,15 @@ class LobbyView(
     private val state: ClientGameState,
     private val onEnterMatch: () -> Unit,
     private val onLeave: () -> Unit,
+    private val onVote: (GameMode) -> Unit,
 ) : LinearLayout(context) {
 
     private val header: TextView
     private val subHeader: TextView
     private val playerList: LinearLayout
     private val hint: TextView
+    private val voteDmButton: android.widget.Button
+    private val voteTdmButton: android.widget.Button
 
     init {
         orientation = HORIZONTAL
@@ -58,6 +61,25 @@ class LobbyView(
             11.5f,
         )
         left.addView(hint)
+
+        left.addView(UiKit.spacer(context, 10f))
+        // P3-4: lobby vote for the ruleset of the NEXT match. A strict majority
+        // of the humans flips the server's configured mode for one match; with
+        // no majority the operator's config wins. Tally arrives in LOBBY_STATE.
+        left.addView(UiKit.label(context, "VOTE THE NEXT MODE (majority of players wins)", 10.5f))
+        val voteRow = UiKit.row(context)
+        voteDmButton = UiKit.button(context, "DM") { onVote(GameMode.DM) }.apply {
+            layoutParams = UiKit.lp(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        voteTdmButton = UiKit.button(context, "TDM") { onVote(GameMode.TDM) }.apply {
+            layoutParams = UiKit.lp(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
+                margins = intArrayOf(UiKit.dp(context, 8f), 0, 0, 0),
+            )
+        }
+        voteRow.addView(voteDmButton)
+        voteRow.addView(voteTdmButton)
+        left.addView(voteRow)
 
         left.addView(UiKit.spacer(context, 14f))
         left.addView(
@@ -109,7 +131,9 @@ class LobbyView(
             append(state.serverName)
             append("  ·  ")
             append(state.serverIp).append(':').append(state.serverPort)
-            append("  ·  ").append(state.mode.name)
+            append("  ·  ").append(state.mode.name) // P2-6: the mode, up front
+            if (state.killLimit > 0) append(" (first to ").append(state.killLimit).append(')')
+            append("  ·  map ").append(state.arena.name)
             append("  ·  ").append(phaseName)
             append("  ·  ping ").append(state.pingMs).append(" ms")
             if (state.mode == GameMode.TDM) {
@@ -121,6 +145,12 @@ class LobbyView(
                 append("\nWARNING: the server's map differs from the one in this APK.")
             }
         }
+
+        // P3-4: live tally next to the buttons; the configured mode is marked.
+        voteDmButton.text = "DM  ${'\u00B7'}  ${state.votesDm}" +
+            if (state.mode == GameMode.DM) "  (current)" else ""
+        voteTdmButton.text = "TDM  ${'\u00B7'}  ${state.votesTdm}" +
+            if (state.mode == GameMode.TDM) "  (current)" else ""
 
         playerList.removeAllViews()
         val rows = state.scoreboardRows()

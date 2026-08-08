@@ -4,9 +4,12 @@ import android.app.Activity
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.view.Choreographer
 import android.view.Gravity
 import android.view.View
@@ -59,6 +62,10 @@ class MainActivity : Activity(), NetworkClient.Listener {
     private var scoreboardVisible = false
     private var panelTick = 0
 
+    /** Last damage timestamp we already vibrated for (the state field is a
+     *  monotonically-updated edge, we must buzz exactly once per hit). */
+    private var lastVibratedDamageMs = 0L
+
     private var frameCallback: Choreographer.FrameCallback? = null
 
     // ------------------------------------------------------------- lifecycle
@@ -80,6 +87,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         state.serverIp = prefs.getString("ip", GameConstants.DEFAULT_SERVER_IP)
             ?: GameConstants.DEFAULT_SERVER_IP
         state.serverPort = prefs.getInt("port", GameConstants.DEFAULT_UDP_PORT)
+        state.password = prefs.getString("pw", "") ?: ""
         input.sensitivity = prefs.getFloat("sens", InputController.DEFAULT_SENSITIVITY)
         input.invertY = prefs.getBoolean("invertY", false)
 
@@ -125,12 +133,13 @@ class MainActivity : Activity(), NetworkClient.Listener {
                 state.phase = Phase.PLAYING
             },
             onLeave = { leaveServer() },
+            onVote = { voteMode -> net?.voteMode(voteMode) },
         ).apply { visibility = View.GONE }
         root.addView(lobby, matchParent())
 
         menu = MenuView(
             this, state, input,
-            onConnect = { ip, port, nick -> connect(ip, port, nick) },
+            onConnect = { ip, port, nick, password -> connect(ip, port, nick, password) },
             onScan = { scanLan() },
             onQuit = { finishAndRemoveTaskCompat() },
         )
@@ -281,6 +290,21 @@ class MainActivity : Activity(), NetworkClient.Listener {
     }
 
     private fun tickUi() {
+        // P2-3: the network thread parks map-rotation requests in the state;
+        // only this thread may touch the APK assets, so the swap happens here.
+        val pending = state.pendingArenaName
+        if (pending != null) {
+            state.pendingArenaName = null
+            hotSwapArena(pending, state.pendingArenaHash)
+        }
+
+        // A short buzz on every hit taken (VIBRATE permission is declared; the
+        // edge detector makes sure one hit = one buzz, even at 60 Hz redraws).
+        if (state.lastDamageTakenMs != lastVibratedDamageMs) {
+            lastVibratedDamageMs = state.lastDamageTakenMs
+            vibrateShort()
+        }
+
         val phase = state.phase
         if (phase != lastPhase) applyPhase(phase)
 
@@ -298,6 +322,63 @@ class MainActivity : Activity(), NetworkClient.Listener {
                 else -> Unit
             }
             if (scoreboardVisible) scoreboard.refresh()
+        }
+    }
+
+    /**
+     * P2-3: loads "<name>.json" from the APK assets and swaps every subsystem
+     * onto it (prediction physics, renderer mesh, tracer raycasts). The hash
+     * sent by the server is verified first when available; on any failure the
+     * old geometry stays and the mismatch banner keeps warning - a wrong map
+     * silently applied would be far worse than no map applied.
+     */
+    private fun hotSwapArena(name: String, expectedHash: Int) {
+        try {
+            val file = if (name.endsWith(".json")) name else "$name.json"
+            assets.open(file).use { stream ->
+                val text = stream.readBytes().toString(Charsets.UTF_8)
+                val newArena = ArenaDef.fromJson(text)
+                if (expectedHash != 0 && newArena.hash() != expectedHash) {
+                    AndroidLog.w(
+                        "refusing arena hot-swap of $file: hash 0x%08X != server's 0x%08X"
+                            .format(newArena.hash(), expectedHash),
+                    )
+                    state.arenaMismatch = true
+                    return
+                }
+                arena = newArena
+                state.arena = newArena
+                state.prediction?.setArena(newArena)
+                net?.updateArena(newArena)
+                gameView.runOnGl { gameView.gameRenderer.setArena(newArena) }
+                state.arenaMismatch = false
+                AndroidLog.i("arena hot-swapped to ${newArena.name}")
+            }
+        } catch (e: Exception) {
+            AndroidLog.w(
+                "this APK has no map for the server's current arena '$name' " +
+                    "(${e.message}); keeping the old geometry",
+            )
+            state.arenaMismatch = true
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun vibrateShort() {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= 23) {
+                getSystemService(Vibrator::class.java)
+            } else {
+                getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            } ?: return
+            if (Build.VERSION.SDK_INT >= 26) {
+                vibrator.vibrate(
+                    VibrationEffect.createOneShot(35, VibrationEffect.DEFAULT_AMPLITUDE),
+                )
+            } else {
+                vibrator.vibrate(35)
+            }
+        } catch (_: Exception) {
         }
     }
 
@@ -370,11 +451,12 @@ class MainActivity : Activity(), NetworkClient.Listener {
 
     // ------------------------------------------------------------ networking
 
-    private fun connect(ip: String, port: Int, nick: String) {
+    private fun connect(ip: String, port: Int, nick: String, password: String) {
         prefs.edit()
             .putString("nick", nick)
             .putString("ip", ip)
             .putInt("port", port)
+            .putString("pw", password)
             .putFloat("sens", input.sensitivity)
             .putBoolean("invertY", input.invertY)
             .apply()
@@ -382,6 +464,7 @@ class MainActivity : Activity(), NetworkClient.Listener {
         hideKeyboard()
         state.resetForNewSession()
         state.nickname = nick
+        state.password = password
         input.setAngles(0f, 0f)
 
         net?.stopNow()

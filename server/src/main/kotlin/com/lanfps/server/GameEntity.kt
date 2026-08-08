@@ -8,6 +8,7 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.SpawnPoint
 import com.lanfps.shared.Team
 import com.lanfps.shared.Vec3
+import com.lanfps.shared.Weapons
 
 /**
  * Anything that can move, be shot, die and respawn. Human players and bots share
@@ -38,6 +39,19 @@ abstract class GameEntity(@JvmField val id: Int) {
 
     @JvmField var lastAttackerId: Int = 0
 
+    // ---- P2-1/P2-2: per-entity weapon state --------------------------------
+    /** Current weapon, an id from [Weapons]. Kept across respawns. */
+    @JvmField var weapon: Int = Weapons.DEFAULT
+
+    /** Rounds left in the magazine, or [Weapons.AMMO_INFINITE] when the server
+     *  runs with `infiniteAmmo=true`. */
+    @JvmField var ammoInMag: Int = Weapons.byId(Weapons.DEFAULT).magazineSize
+
+    /** >0 while a reload is in progress; counts down to the refill tick. */
+    @JvmField var reloadTimer: Float = 0f
+
+    val reloading: Boolean get() = reloadTimer > 0f
+
     abstract val entityType: Int
 
     val isBot: Boolean get() = entityType == EntityType.BOT
@@ -60,6 +74,10 @@ abstract class GameEntity(@JvmField val id: Int) {
         fireCooldown = 0f
         firedThisTick = false
         lastAttackerId = 0
+        // Weapon identity survives death; the magazine is refilled
+        // (World.respawn upgrades this to AMMO_INFINITE when configured).
+        ammoInMag = Weapons.byId(weapon).magazineSize
+        reloadTimer = 0f
     }
 
     open fun kill() {
@@ -86,6 +104,8 @@ abstract class GameEntity(@JvmField val id: Int) {
         dst.health = health
         dst.kills = kills
         dst.deaths = deaths
+        dst.weapon = weapon
+        dst.ammo = ammoInMag
         dst.flags = 0
         dst.alive = alive
         dst.firing = firedThisTick

@@ -27,7 +27,7 @@ class MenuView(
     context: Context,
     private val state: ClientGameState,
     private val input: InputController,
-    private val onConnect: (ip: String, port: Int, nick: String) -> Unit,
+    private val onConnect: (ip: String, port: Int, nick: String, password: String) -> Unit,
     private val onScan: () -> Unit,
     private val onQuit: () -> Unit,
 ) : LinearLayout(context) {
@@ -35,6 +35,7 @@ class MenuView(
     private val nickField: EditText
     private val ipField: EditText
     private val portField: EditText
+    private val passwordField: EditText
     private val statusLabel: TextView
     private val serverList: LinearLayout
     private val localIpLabel: TextView
@@ -108,6 +109,18 @@ class MenuView(
         portCol.addView(portField)
         addrRow.addView(portCol)
         form.addView(addrRow)
+
+        // P0-3 (optional): only needed when the server operator set password=
+        // in server.properties; empty means "open server".
+        form.addView(UiKit.label(context, "PASSWORD (optional - only if the server asks for one)"))
+        passwordField = UiKit.field(context, state.password, "leave empty for open servers").apply {
+            layoutParams = UiKit.lp(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                margins = intArrayOf(0, UiKit.dp(context, 4f), 0, 0),
+            )
+        }
+        form.addView(passwordField)
 
         form.addView(UiKit.spacer(context, 14f))
 
@@ -240,6 +253,7 @@ class MenuView(
         val ip = ipField.text.toString().trim()
         val port = portField.text.toString().trim().toIntOrNull()
             ?: GameConstants.DEFAULT_UDP_PORT
+        val password = passwordField.text.toString().trim().take(32)
 
         if (ip.isEmpty()) {
             setStatus("Enter the server IP address, e.g. ${GameConstants.DEFAULT_SERVER_IP}", true)
@@ -249,7 +263,7 @@ class MenuView(
             setStatus("Port must be between 1 and 65535", true)
             return
         }
-        onConnect(ip, port, nick)
+        onConnect(ip, port, nick, password)
     }
 
     fun setStatus(msg: String, error: Boolean = false) {

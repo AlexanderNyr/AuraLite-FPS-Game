@@ -6,6 +6,8 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.RayMath
 import com.lanfps.shared.Vec3
+import com.lanfps.shared.WeaponDef
+import com.lanfps.shared.Weapons
 
 /**
  * Authoritative hitscan resolution.
@@ -39,6 +41,30 @@ class ServerRaycast(private val arena: ArenaDef) {
     private val dir = Vec3()
     private val box = Aabb()
 
+    // Scratch for the P2-1 burst cast: basis vectors around the aim direction.
+    private val basisR = Vec3()
+    private val basisU = Vec3()
+    private val pelletDir = Vec3()
+
+    /** Deterministic enough for a LAN: server-side only, so prediction never
+     *  needs to reproduce it — spread is part of the authoritative verdict. */
+    private val rng = java.util.Random()
+
+    /**
+     * Result of [fireWeapon]: total damage to apply per entity. Multiple
+     * pellets of one burst can stack on the same victim.
+     */
+    class WeaponResult {
+        @JvmField val damageByEntity: HashMap<GameEntity, Int> = HashMap()
+
+        fun reset(): WeaponResult {
+            damageByEntity.clear()
+            return this
+        }
+    }
+
+    private val weaponResult = WeaponResult()
+
     /**
      * Casts the shooter's weapon ray.
      *
@@ -52,7 +78,7 @@ class ServerRaycast(private val arena: ArenaDef) {
     fun fire(
         shooter: GameEntity,
         candidates: Collection<GameEntity>,
-        range: Float = GameConstants.WEAPON_RANGE,
+        range: Float = Weapons.RifleDef.range,
         rewindPositions: Map<Int, Vec3>? = null,
     ): Hit {
         result.reset()
@@ -99,4 +125,82 @@ class ServerRaycast(private val arena: ArenaDef) {
     /** Line-of-sight between two eye positions; used by bot vision. */
     fun hasLineOfSight(from: Vec3, to: Vec3): Boolean =
         RayMath.hasLineOfSight(from, to, arena, dir)
+
+    /**
+     * P2-1: fires a full burst of [weapon] (1..n pellets) with the weapon's
+     * spread cone applied per pellet, and returns the total damage per victim.
+     *
+     * Walls are honoured per pellet: a shotgun blast against a divider stops on
+     * the divider. Lag compensation applies to every pellet identically.
+     */
+    fun fireWeapon(
+        shooter: GameEntity,
+        weapon: WeaponDef,
+        candidates: Collection<GameEntity>,
+        rewindPositions: Map<Int, Vec3>? = null,
+    ): WeaponResult {
+        weaponResult.reset()
+        shooter.eyePosition(origin)
+
+        val tanSpread = if (weapon.spreadDeg > 0f) {
+            kotlin.math.tan(weapon.spreadDeg * MathUtil.DEG_TO_RAD)
+        } else {
+            0f
+        }
+
+        MathUtil.forwardFromAngles(shooter.body.yaw, shooter.body.pitch, dir)
+        // Build an orthonormal basis (dir, basisR, basisU) for the spread cone.
+        basisR.set(-dir.z, 0f, dir.x)
+        if (basisR.lengthSquared() < 1e-6f) {
+            basisR.set(1f, 0f, 0f)
+        }
+        basisR.normalize()
+        basisU.set(
+            basisR.z * dir.y - basisR.y * dir.z,
+            basisR.x * dir.z - basisR.z * dir.x,
+            basisR.y * dir.x - basisR.x * dir.y,
+        )
+
+        for (pellet in 0 until weapon.pellets) {
+            if (tanSpread > 0f) {
+                val rx = (rng.nextFloat() * 2f - 1f) * tanSpread
+                val ry = (rng.nextFloat() * 2f - 1f) * tanSpread
+                pelletDir.set(dir)
+                pelletDir.addScaled(basisR, rx)
+                pelletDir.addScaled(basisU, ry)
+                pelletDir.normalize()
+            } else {
+                pelletDir.set(dir)
+            }
+
+            // How far can this pellet travel before it hits the level?
+            val wallDistance = RayMath.raycastArena(origin, pelletDir, weapon.range, arena)
+
+            var nearest = wallDistance
+            var hitEntity: GameEntity? = null
+            for (e in candidates) {
+                if (e === shooter || !e.alive) continue
+                if (rewindPositions != null) {
+                    val p = rewindPositions[e.id]
+                    if (p != null) {
+                        box.setFromBody(p, GameConstants.PLAYER_RADIUS, e.body.height)
+                    } else {
+                        e.hitbox(box)
+                    }
+                } else {
+                    e.hitbox(box)
+                }
+                val t = RayMath.rayAabb(origin, pelletDir, box, nearest)
+                if (t != RayMath.NO_HIT && t < nearest) {
+                    nearest = t
+                    hitEntity = e
+                }
+            }
+
+            if (hitEntity != null) {
+                weaponResult.damageByEntity.merge(hitEntity, weapon.damage, Int::plus)
+            }
+        }
+        return weaponResult
+    }
 }

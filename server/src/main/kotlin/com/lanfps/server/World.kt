@@ -1,9 +1,12 @@
 package com.lanfps.server
 
+import com.lanfps.shared.ArenaDef
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.InputCommand
+import com.lanfps.shared.MathUtil
 import com.lanfps.shared.Team
+import com.lanfps.shared.Weapons
 
 /** A kill that still needs broadcasting to clients. */
 class KillEvent(
@@ -21,7 +24,7 @@ class KillEvent(
  * and *observe* (via snapshots) — they never assert state.
  */
 class World(
-    @JvmField val serverArena: ServerArena,
+    serverArenaParam: ServerArena,
     @JvmField val config: ServerConfig,
 ) {
     @JvmField var mode: GameMode = config.mode
@@ -40,15 +43,23 @@ class World(
     /** Insertion-ordered so snapshots have a stable entity order. */
     @JvmField val entities: LinkedHashMap<Int, GameEntity> = LinkedHashMap()
 
-    @JvmField val physics: ServerPhysics = ServerPhysics(serverArena)
-    @JvmField val raycast: ServerRaycast = ServerRaycast(serverArena.def)
+    /** The arena runtime. `var` because P2-3 rotates maps between matches. */
+    var serverArena: ServerArena = serverArenaParam
+        private set
+
+    var physics: ServerPhysics = ServerPhysics(serverArena)
+        private set
+
+    var raycast: ServerRaycast = ServerRaycast(serverArena.def)
+        private set
+
     @JvmField val score: ScoreSystem = ScoreSystem()
 
     /** P1-1: past entity positions so a shot can be rewound to what the shooter
      *  actually saw (lag compensation). */
     @JvmField val history: PositionHistory = PositionHistory()
 
-    private val botAI: BotAI = BotAI(this, serverArena, config.botDifficulty)
+    private var botAI: BotAI = BotAI(this, serverArena)
 
     /** Drained by [GameServer] each tick and sent as MATCH_EVENT packets. */
     @JvmField val killFeed: ArrayList<KillEvent> = ArrayList()
@@ -86,6 +97,11 @@ class World(
             val id = GameConstants.BOT_ID_BASE + nextBotIndex
             nextBotIndex++
             val bot = BotEntity(id, botName(botList.size))
+            // P2-4: spread skill around the configured difficulty (golden-ratio
+            // hash of the id is deterministic and well distributed). A match
+            // with a mix of sharp and sloppy bots feels far more alive.
+            val hash = (id * 0.6180339887f) % 1f
+            bot.skill = MathUtil.clamp(config.botDifficulty + (hash - 0.5f) * 0.5f, 0.05f, 1f)
             bot.team = assignTeam()
             entities[bot.id] = bot
             botList.add(bot)
@@ -160,9 +176,10 @@ class World(
             session.refillTokens(dt)
             val cmd = session.nextCommand()
             e.firedThisTick = false
-            if (e.fireCooldown > 0f) e.fireCooldown -= dt
+            updateWeaponTimers(e, dt)
 
             if (cmd != null && e.alive) {
+                applyWeaponIntent(e, cmd)
                 physics.step(e, cmd, dt)
                 handleFire(e, cmd.firePressed)
             } else if (e.alive) {
@@ -178,8 +195,9 @@ class World(
         for (bot in botList) {
             botAI.update(bot, dt)
             bot.firedThisTick = false
-            if (bot.fireCooldown > 0f) bot.fireCooldown -= dt
+            updateWeaponTimers(bot, dt)
             if (bot.alive) {
+                applyWeaponIntent(bot, bot.input)
                 physics.step(bot, bot.input, dt)
                 handleFire(bot, bot.input.firePressed)
             }
@@ -199,20 +217,83 @@ class World(
         history.record(entities.values)
     }
 
+    // ---- P2-1/P2-2: weapons, ammo, reloads ---------------------------------
+
+    /** Applies weapon-switch and reload requests from one input command. */
+    private fun applyWeaponIntent(e: GameEntity, cmd: InputCommand) {
+        if (Weapons.isValid(cmd.weapon) && cmd.weapon != e.weapon) {
+            e.weapon = cmd.weapon
+            // Arcade-style switch: a fresh magazine, no pending reload, and a
+            // short draw time so swapping mid-fight is a small commitment.
+            e.ammoInMag = if (config.infiniteAmmo) {
+                Weapons.AMMO_INFINITE
+            } else {
+                Weapons.byId(e.weapon).magazineSize
+            }
+            e.reloadTimer = 0f
+            e.fireCooldown = maxOf(e.fireCooldown, WEAPON_SWITCH_SECONDS)
+        }
+        if (cmd.reloadPressed) startReload(e)
+    }
+
+    /** Begins a reload when it makes sense. No-op with infinite ammo. */
+    fun startReload(e: GameEntity) {
+        if (config.infiniteAmmo || e.ammoInMag == Weapons.AMMO_INFINITE) return
+        val def = Weapons.byId(e.weapon)
+        if (e.reloading || e.ammoInMag >= def.magazineSize) return
+        e.reloadTimer = def.reloadSeconds
+    }
+
+    private fun updateWeaponTimers(e: GameEntity, dt: Float) {
+        if (e.fireCooldown > 0f) e.fireCooldown -= dt
+        if (e.reloadTimer > 0f) {
+            e.reloadTimer -= dt
+            if (e.reloadTimer <= 0f) {
+                e.reloadTimer = 0f
+                e.ammoInMag = Weapons.byId(e.weapon).magazineSize
+            }
+        }
+        // A dry gun reloads itself: nobody (and no bot) should ever stand
+        // around on an empty chamber waiting to be shot. The reload runs in
+        // parallel with any leftover fire cooldown of the previous weapon.
+        if (!config.infiniteAmmo && e.alive &&
+            e.ammoInMag <= 0 && e.reloadTimer <= 0f
+        ) {
+            startReload(e)
+        }
+    }
+
     private fun handleFire(shooter: GameEntity, firePressed: Boolean) {
         if (!combatEnabled) return
         if (!firePressed || !shooter.alive) return
-        if (shooter.fireCooldown > 0f) return
 
-        shooter.fireCooldown = GameConstants.WEAPON_FIRE_INTERVAL
+        val def = Weapons.byId(shooter.weapon)
+        // Empty chamber: kick off the reload right away, even if the previous
+        // shot's cooldown is still draining — the timers run in parallel and
+        // [updateWeaponTimers] would do it next tick anyway.
+        if (!config.infiniteAmmo && shooter.ammoInMag <= 0) {
+            startReload(shooter)
+            return
+        }
+        if (shooter.fireCooldown > 0f) return
+        if (shooter.reloading) return
+
+        shooter.fireCooldown = def.fireInterval
         shooter.firedThisTick = true
+        if (!config.infiniteAmmo && shooter.ammoInMag != Weapons.AMMO_INFINITE) {
+            shooter.ammoInMag--
+        }
 
         val rewindTicks = lagCompRewindTicks(shooter)
         val rewindPositions =
             if (rewindTicks > 0) history.positionsAtTicksAgo(rewindTicks) else null
-        val hit = raycast.fire(shooter, hostilesOf(shooter), rewindPositions = rewindPositions)
-        val victim = hit.entity ?: return
-        applyDamage(victim, shooter, GameConstants.WEAPON_DAMAGE)
+        val burst = raycast.fireWeapon(shooter, def, hostilesOf(shooter), rewindPositions = rewindPositions)
+        for ((victim, damage) in burst.damageByEntity) {
+            applyDamage(victim, shooter, damage)
+        }
+
+        // P2-4: gunfire is loud — bots within earshot turn toward it.
+        botAI.onShotFired(shooter)
     }
 
     /**
@@ -247,6 +328,40 @@ class World(
     fun respawn(entity: GameEntity) {
         val spawn = serverArena.pickSpawn(entity.team, enemiesOf(entity))
         entity.spawnAt(spawn)
+        if (config.infiniteAmmo) entity.ammoInMag = Weapons.AMMO_INFINITE
+    }
+
+    /**
+     * P2-3: swaps the world onto a new arena between matches (map rotation).
+     * Physics, hit detection and bot navigation are rebuilt for the new
+     * geometry and everyone is respawned into it.
+     */
+    fun setArena(def: ArenaDef) {
+        serverArena = ServerArena(def)
+        physics = ServerPhysics(serverArena)
+        raycast = ServerRaycast(def)
+        botAI = BotAI(this, serverArena)
+        history.clear()
+        for (e in entities.values) respawn(e)
+        Log.info("arena switched -> ${def.describe()}")
+        Log.info(serverArena.describeGraph())
+    }
+
+    /**
+     * P2-7: re-deals TDM teams between matches. Players alternate by current
+     * score so the two sides stay as even in count and strength as possible.
+     */
+    fun balanceTeams() {
+        if (!mode.isTeamBased) return
+        val sorted = entities.values.sortedByDescending { it.kills }
+        var flip = false
+        for (e in sorted) {
+            flip = !flip
+            e.team = if (flip) Team.RED else Team.BLUE
+        }
+        val red = entities.values.count { it.team == Team.RED }
+        val blue = entities.values.count { it.team == Team.BLUE }
+        Log.info("teams rebalanced for the next match: RED=$red BLUE=$blue")
     }
 
     /** Full reset between matches: scores cleared, everyone respawned. */
@@ -277,6 +392,9 @@ class World(
 
         /** Shared "no intent" command used when a client's input queue is empty. */
         private val IDLE_COMMAND = InputCommand()
+
+        /** Seconds a weapon switch takes before the new gun can fire. */
+        private const val WEAPON_SWITCH_SECONDS = 0.4f
 
         private fun InputCommand.crouchPressed() {
             moveForward = 0f

@@ -14,6 +14,8 @@ object PacketTypes {
     const val DISCONNECT: Int = 10
     const val LOBBY_STATE: Int = 11
     const val MATCH_EVENT: Int = 12
+    /** P3-4: client -> server lobby vote for the ruleset of the next match. */
+    const val MODE_VOTE: Int = 13
 
     fun name(type: Int): String = when (type) {
         DISCOVERY_REQUEST -> "DISCOVERY_REQUEST"
@@ -28,6 +30,7 @@ object PacketTypes {
         DISCONNECT -> "DISCONNECT"
         LOBBY_STATE -> "LOBBY_STATE"
         MATCH_EVENT -> "MATCH_EVENT"
+        MODE_VOTE -> "MODE_VOTE"
         else -> "UNKNOWN($type)"
     }
 }

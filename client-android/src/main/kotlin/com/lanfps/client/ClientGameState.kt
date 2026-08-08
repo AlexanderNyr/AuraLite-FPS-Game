@@ -6,6 +6,7 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.MatchState
 import com.lanfps.shared.Team
+import com.lanfps.shared.Weapons
 
 /** Where the app currently is. Drives which View is on top. */
 enum class Phase {
@@ -59,7 +60,7 @@ class DiscoveredServer(
  * Keeping all cross-thread state in one place is what stops the renderer and the
  * network loop from quietly disagreeing.
  */
-class ClientGameState(@JvmField val arena: ArenaDef) {
+class ClientGameState(@JvmField var arena: ArenaDef) {
 
     // ---- session ----------------------------------------------------------
     @Volatile var phase: Phase = Phase.MENU
@@ -69,6 +70,10 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
     @Volatile var serverIp: String = GameConstants.DEFAULT_SERVER_IP
     @Volatile var serverPort: Int = GameConstants.DEFAULT_UDP_PORT
     @Volatile var nickname: String = "Player"
+
+    /** P0-3 (optional): the server password typed on the menu, sent verbatim
+     *  inside CONNECT_REQUEST. Empty for open servers. */
+    @Volatile var password: String = ""
 
     @Volatile var localPlayerId: Int = -1
     @Volatile var localTeam: Team = Team.NONE
@@ -89,12 +94,31 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
     @Volatile var redScore: Int = 0
     @Volatile var blueScore: Int = 0
 
+    /** P2-6: kill goal of the current match, from LOBBY_STATE (0 = hidden). */
+    @Volatile var killLimit: Int = 0
+
+    /** P3-4: current MODE_VOTE tally, from LOBBY_STATE. */
+    @Volatile var votesDm: Int = 0
+    @Volatile var votesTdm: Int = 0
+
     // ---- local player -----------------------------------------------------
     @Volatile var health: Int = GameConstants.MAX_HEALTH
     @Volatile var alive: Boolean = false
     @Volatile var kills: Int = 0
     @Volatile var deaths: Int = 0
     @Volatile var respawnInSec: Float = 0f
+
+    /** P2-1: our current weapon as the server reports it (drives HUD/viewmodel). */
+    @Volatile var localWeapon: Int = Weapons.DEFAULT
+
+    /** P2-2: rounds in our magazine, or [Weapons.AMMO_INFINITE] (HUD shows ∞). */
+    @Volatile var localAmmo: Int = Weapons.AMMO_INFINITE
+
+    /** P2-5: entity to spectate while we are dead (usually our killer), -1 = off. */
+    @Volatile var spectateId: Int = -1
+
+    /** Set on every health drop so the UI can vibrate exactly once per hit. */
+    @Volatile var lastDamageTakenMs: Long = 0
 
     /** Predicted render transform, published by the network thread each tick. */
     @Volatile var eyeX: Float = 0f
@@ -125,6 +149,16 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
 
     /** Non-null once the arena is known; created by [MainActivity]. */
     @Volatile var prediction: Prediction? = null
+
+    // ---- P2-3: map rotation hot-load ---------------------------------------
+    // A rotated map cannot be swapped by the network thread: the JSON lives in
+    // the APK assets, which only the activity should touch. So the network
+    // thread just parks the request here and MainActivity picks it up on the
+    // next UI tick (hotSwapArena).
+    @Volatile var pendingArenaName: String? = null
+
+    /** FNV-1a hash the new arena must have, 0 = trust whatever we load. */
+    @Volatile var pendingArenaHash: Int = 0
 
     private val killFeedLock = Any()
     private val killFeed = ArrayList<KillFeedEntry>()
@@ -307,5 +341,14 @@ class ClientGameState(@JvmField val arena: ArenaDef) {
         arenaMismatch = false
         errorText = ""
         recoilPitch = 0f
+        killLimit = 0
+        votesDm = 0
+        votesTdm = 0
+        localWeapon = Weapons.DEFAULT
+        localAmmo = Weapons.AMMO_INFINITE
+        spectateId = -1
+        lastDamageTakenMs = 0
+        pendingArenaName = null
+        pendingArenaHash = 0
     }
 }

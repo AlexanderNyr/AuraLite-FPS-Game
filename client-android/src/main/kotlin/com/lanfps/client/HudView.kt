@@ -12,6 +12,7 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
 import com.lanfps.shared.MatchState
 import com.lanfps.shared.Team
+import com.lanfps.shared.Weapons
 import kotlin.math.max
 import kotlin.math.min
 
@@ -148,10 +149,12 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
         val cx = w / 2f
         val cy = h / 2f
 
-        // The gap grows with movement speed and recoil: honest feedback that you
-        // are less accurate on the move.
+        // The gap grows with the weapon's spread cone, movement speed and
+        // recoil: honest feedback of where the burst can actually land. A
+        // shotgun crosshair is wide open, a sniper's is a pin.
         val moveT = min(state.localSpeed / GameConstants.MOVE_SPEED, 1f)
-        val gap = dp(5f) + dp(7f) * moveT + dp(2.2f) * state.recoilPitch
+        val spread = Weapons.byId(state.localWeapon).spreadDeg
+        val gap = dp(5f) + dp(7f) * moveT + dp(2.2f) * state.recoilPitch + dp(1.7f) * spread
         val len = dp(7f)
 
         paint.style = Paint.Style.STROKE
@@ -212,6 +215,14 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
         text.color = Color.argb(210, 226, 232, 240)
         val secs = max(state.respawnInSec, 0f)
         canvas.drawText("respawning in %.1f s".format(secs), w / 2f, h / 2f + dp(18f), text)
+
+        // P2-5: tell the player whose eyes they are currently borrowing.
+        if (state.spectateId >= 0) {
+            text.textSize = dp(13f)
+            text.color = Color.argb(190, 240, 186, 110)
+            val who = state.rosterName(state.spectateId) ?: "???"
+            canvas.drawText("spectating $who until respawn", w / 2f, h / 2f + dp(42f), text)
+        }
     }
 
     // ------------------------------------------------------------ status HUD
@@ -253,15 +264,25 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
         text.color = Color.argb(170, 139, 148, 158)
         canvas.drawText("HP", left + dp(34f), bottom - barH - dp(8f), text)
 
-        // Ammo (infinite in this build) and nickname.
+        // Ammo and weapon (P2-1/P2-2): the infinity glyph when the server runs
+        // with infiniteAmmo, the honest round count otherwise. An empty mag is
+        // amber - the reload is already running on the server.
         text.textAlign = Paint.Align.RIGHT
         text.textSize = dp(22f)
-        text.color = Color.argb(230, 240, 246, 252)
-        val ammo = if (GameConstants.WEAPON_INFINITE_AMMO) "\u221E" else "30"
+        val infinite = state.localAmmo == Weapons.AMMO_INFINITE
+        val ammo = if (infinite) "\u221E" else "${max(state.localAmmo, 0)}"
+        text.color = when {
+            infinite -> Color.argb(230, 240, 246, 252)
+            state.localAmmo <= 0 -> Color.argb(235, 232, 190, 84)
+            else -> Color.argb(230, 240, 246, 252)
+        }
         canvas.drawText(ammo, w - dp(26f), bottom - dp(74f), text)
         text.textSize = dp(11f)
         text.color = Color.argb(170, 139, 148, 158)
-        canvas.drawText("RIFLE", w - dp(26f), bottom - dp(58f), text)
+        canvas.drawText(
+            Weapons.byId(state.localWeapon).displayName,
+            w - dp(26f), bottom - dp(58f), text,
+        )
 
         text.textAlign = Paint.Align.LEFT
         text.textSize = dp(12f)
@@ -291,9 +312,12 @@ class HudView(context: Context, private val state: ClientGameState) : View(conte
 
         text.textSize = dp(10.5f)
         text.color = Color.argb(160, 139, 148, 158)
+        // P2-6: the mode and the win condition, always visible in the match.
         val phase = when (state.matchState) {
-            MatchState.WARMUP -> "WARMUP"
-            MatchState.ACTIVE -> state.mode.name
+            MatchState.WARMUP -> "WARMUP  ·  ${state.mode.name}"
+            MatchState.ACTIVE ->
+                if (state.killLimit > 0) "${state.mode.name}  ·  FIRST TO ${state.killLimit}"
+                else state.mode.name
             MatchState.ENDED -> "MATCH OVER"
             else -> ""
         }

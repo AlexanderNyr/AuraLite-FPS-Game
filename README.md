@@ -52,7 +52,7 @@ play: one Wi-Fi router (or hotspot) and nothing else.
 4. The window prints the PC's IPv4 addresses. Note the `192.168.x.x` one.
 
 ```
-[INFO] LAN FPS Server  protocolVersion=1
+[INFO] LAN FPS Server  protocolVersion=3
 [INFO] listening on 0.0.0.0:7777
 [INFO] arena=arena01  brushes=24  hash=0x01895281
 [INFO] bots spawned: 4
@@ -80,15 +80,29 @@ If step 7 fails, that is almost always the Windows firewall. See
 |---|---|
 | Left half of the screen | Floating stick — walk / strafe |
 | Right half of the screen | Drag to look (sensitivity + invert-Y in the menu) |
-| **FIRE** button (bottom right) | Shoot — hold for automatic fire (8 rounds/s) |
+| **FIRE** button (bottom right) | Shoot — rate of fire depends on the weapon |
+| **WPN** button | Cycle weapon: **RIFLE → SHOTGUN → SNIPER** (label shows the current one) |
+| **RLD** button | Reload (dark guns reload themselves too, this just saves you the wait) |
 | **JUMP** button | Jump |
 | **CROUCH** button | Toggle crouch (slower, smaller, harder to hit) |
 | **TAB** button | Hold to show the scoreboard |
 | **☰** (top left) | Pause / disconnect |
 
-The HUD shows a dynamic crosshair (it opens up when you move or fire), health,
-ammo (`∞`), the match timer, the score, your ping, a kill feed and floating name
-plates over the other players.
+The three weapons (P2-1 of the improvement plan):
+
+| Weapon | Damage | Rate | Range | Magazine | Character |
+|---|---|---|---|---|---|
+| **RIFLE** | 25 | 8/s | 120 m | 30 | the all-rounder, pinpoint first shot |
+| **SHOTGUN** | 7 × 11 pellets | ~1.2/s | 45 m | 6 | instantly deletes anyone at arm's length |
+| **SNIPER** | 90 | ~0.7/s | 200 m | 5 | one body shot leaves anyone at 10 hp |
+
+Weapons have magazines and reload times by default (`infiniteAmmo=false`); the
+old bottomless rules are one line away in `server.properties`. The HUD shows
+the current weapon, the honest round count (or `∞`), a crosshair that opens with
+the weapon's spread cone, movement and recoil, health, the match timer, the
+mode and kill goal, your ping, a kill feed and floating name plates over the
+other players. When you die you **spectate your killer** until the respawn
+(P2-5), and the phone gives a short vibration buzz on every hit you take.
 
 ---
 
@@ -104,32 +118,35 @@ lanfps/
 ├── shared/                    pure-JVM code used by BOTH sides
 │   └── src/main/kotlin/com/lanfps/shared/
 │       ├── Protocol.kt        magic 0x4C414E46 "LANF", 16-byte header, CRC32
-│       ├── Packets.kt         encode/decode for all 12 packet types
-│       ├── PacketTypes.kt     DISCOVERY / CONNECT / INPUT / SNAPSHOT / PING / ...
-│       ├── InputCommand.kt    24-byte client command + sanitise()
-│       ├── EntityState.kt     quantised entity wire format
-│       ├── Snapshot.kt        one server frame
+│       ├── Packets.kt         encode/decode for all 13 packet types
+│       ├── PacketTypes.kt     DISCOVERY / CONNECT / INPUT / SNAPSHOT / PING / MODE_VOTE / ...
+│       ├── InputCommand.kt    client command (stick, angles, buttons, weapon) + sanitise()
+│       ├── EntityState.kt     quantised entity wire format (incl. weapon + ammo)
+│       ├── Snapshot.kt        one server frame; SnapshotDelta.kt is the DELTA encoding
+│       ├── WeaponDef.kt       the weapon catalogue — RIFLE / SHOTGUN / SNIPER (P2-1)
 │       ├── Movement.kt        MovementSolver — THE shared physics step
 │       ├── RayMath.kt         ray/AABB + ray/capsule intersection
-│       ├── ArenaDef.kt        the map, as data (24 brushes, 8 spawns, 16 waypoints)
+│       ├── ArenaDef.kt        the map, as data (brushes, spawns, waypoints)
 │       ├── GameConstants.kt   every tunable number, one place
 │       └── BinaryReader/Writer, Checksum, MiniJson, MathTypes, Team, GameMode
 │
 ├── server/                    headless console app (Windows 10 / any JVM)
 │   ├── src/main/kotlin/com/lanfps/server/
 │   │   ├── Main.kt            arg parsing, banner, shutdown hook
-│   │   ├── GameServer.kt      socket + 60 Hz tick loop + 30 Hz snapshot loop
-│   │   ├── UdpServerSocket.kt receive/send, CRC validation, rate limits
-│   │   ├── ClientSession.kt   per-client state, input queue, ping, timeout
-│   │   ├── World.kt           entity registry, spawn selection
+│   │   ├── GameServer.kt      protocol, 60 Hz tick loop, rotation, votes, metrics
+│   │   ├── SessionManager.kt  sessions: flood guard, zombies, reconnects (P0/P3-4)
+│   │   ├── UdpServerSocket.kt receive/send, CRC validation
+│   │   ├── ClientSession.kt   per-client state, input queue, RTT/loss metrics
+│   │   ├── World.kt           entities, weapons/ammo rules, damage, respawn
 │   │   ├── Physics.kt         drives the shared MovementSolver
-│   │   ├── Raycast.kt         hit detection — the ONLY place damage is decided
-│   │   ├── BotAI.kt/BotEntity PATROL → SEEK → ATTACK → EVADE → RESPAWN_WAIT
-│   │   ├── MatchController.kt DM / TDM rules, timer, kill limit, end-of-match
+│   │   ├── Raycast.kt         hit detection + per-pellet bursts — damage is ONLY here
+│   │   ├── BotAI.kt/BotEntity PATROL → SEEK → ATTACK → EVADE, hearing, cover, skill mix
+│   │   ├── MatchController.kt DM / TDM rules, timer, kill limit, between-match hooks
 │   │   ├── ScoreSystem.kt     kills, deaths, team scores
-│   │   ├── SnapshotBuilder.kt packs a snapshot per client
-│   │   └── tools/TestClient.kt headless protocol client — the best LAN diagnostic
-│   ├── src/main/resources/    server.properties, arena01.json
+│   │   ├── SnapshotBuilder.kt packs a snapshot per client (FULL keyframes + DELTAs)
+│   │   ├── LagCompensation.kt PositionHistory — rewind targets on a shot (P1-1)
+│   │   └── tools/             TestClient.kt (LAN diagnostic), ChaosProxy.kt (P3-1)
+│   ├── src/main/resources/    server.properties, arena01/02/03.json
 │   ├── run-server.bat
 │   └── README_SERVER_WINDOWS.txt
 │
@@ -188,22 +205,46 @@ Two different problems need two different fixes:
   packets are re-sorted, duplicates dropped, and late arrivals are excluded from
   the clock-offset estimate so one delayed datagram cannot rewind the timeline.
 
-### The map
+### The maps
 
-`arena01` is an original low-poly arena — a symmetric 60 × 40 m indoor space with
-a centre pillar, two lane dividers, crates and a raised catwalk, RED spawns west
-and BLUE spawns east. It is stored as data (`arena01.json`, 24 brushes, 8 spawns,
-16 bot waypoints) and shipped in **both** the jar and the APK's assets. Both
-sides hash it (`0x01895281`) and the HUD warns if they disagree. No copyrighted
-assets are used anywhere: every texture is a shader, every icon is a vector.
+Three original low-poly arenas ship as data, in **both** the jar and the APK's
+assets: `arena01` (the original 60 × 40 m arena — centre pillar, lane dividers,
+crates), `arena02` *Crossfire* (a 44 × 44 open plaza split by a wall cross with
+four diagonal gaps) and `arena03` *Foundry* (a 40 × 30 furnace hall with two
+offset divider walls). Enable rotation in `server.properties`:
+
+```properties
+mapRotation=arena01.json,arena02.json,arena03.json
+```
+
+Between matches the server swaps the world onto the next map and announces it in
+the `MATCH_START` event (arena name + geometry hash). Clients hot-load the same
+JSON from their APK assets, verify the hash, and rebuild prediction, raycasts
+and the render mesh — nobody restarts anything. Both sides hash every map and
+the HUD warns if they ever disagree. No copyrighted assets are used anywhere:
+every texture is a shader, every icon is a vector.
+
+### Weapons, ammo and reloads
+
+Three hitscan weapons live in one shared catalogue (`WeaponDef.kt`) so the
+server's verdict and the client's tracers/recoil/HUD read the same numbers:
+damage, pellets, spread cone, rate of fire, magazine, reload time, range and
+recoil. The shotgun's per-pellet cones are rolled on the server — prediction
+never guesses — and walls stop pellets individually. With the default
+`infiniteAmmo=false` every weapon has a magazine; empty guns reload themselves
+(the RLD button is a convenience, never a requirement). `infiniteAmmo=true`
+restores the classic arena rules: bottomless magazines, the HUD shows `∞`.
 
 ### Bots
 
 Bots fill the server so the game is playable with one phone. They run a small
 state machine — `PATROL` along the waypoint graph → `SEEK` a heard/seen enemy →
-`ATTACK` with human-ish turn rate and aim error → `EVADE` at low health →
-`RESPAWN_WAIT`. Difficulty (`botDifficulty`, 0.0–1.0) scales turn speed and aim
-cone. They obey exactly the same physics and raycast rules as human players.
+`ATTACK` with human-ish turn rate and aim error → `EVADE` into *actual cover* at
+low health → `RESPAWN_WAIT`. The `botDifficulty` setting is a **mean**: every
+bot gets a fixed individual skill offset, so a match mixes sharp and sloppy
+opponents instead of clones (P2-4). Bots **hear** gunshots within ~30 m and
+investigate, pick the sane weapon for their engagement range (sniper far,
+shotgun close), and obey exactly the same physics and raycast rules as humans.
 
 ---
 
@@ -223,23 +264,30 @@ run-server.bat --selfTestSeconds=10     REM headless smoke test, no clients need
 |---|---|---|
 | `--udpPort` | `7777` | UDP port for *all* traffic |
 | `--bindAddress` | `0.0.0.0` | leave as-is; `0.0.0.0` = all interfaces |
-| `--mode` | `DM` | `DM` deathmatch, `TDM` red vs blue |
+| `--mode` | `DM` | `DM` deathmatch, `TDM` red vs blue (the *default*; see lobby votes) |
 | `--botCount` | `4` | 0–16 AI opponents |
 | `--maxPlayers` | `8` | human slots |
 | `--matchTimeSeconds` | `300` | match length |
 | `--killLimit` | `20` | early-win score |
-| `--botDifficulty` | `0.55` | 0.0 easy → 1.0 hard |
+| `--botDifficulty` | `0.55` | 0.0 easy → 1.0 hard — the mean; each bot gets its own offset |
+| `--infiniteAmmo` | `false` | `true` = classic bottomless magazines |
+| `--mapRotation` | *(empty)* | comma-separated maps rotated between matches (P2-3) |
+| `--password` | *(empty)* | optional plain-text door lock for a private LAN (P0-3) |
+| `--statsCsv` | *(empty)* | append server metrics to this CSV every 10 s (P3-3) |
 | `--enableDiscovery` | `true` | answer LAN broadcast (SCAN button) |
 | `--logLevel` | `INFO` | `DEBUG` / `INFO` / `WARN` / `ERROR` |
 
 Stop it with `Ctrl+C`; the shutdown hook tells connected clients to disconnect
 cleanly instead of letting them time out.
 
-> **The game mode is a server setting.** There is no mode picker in the phone
-> UI: whatever you put in `server.properties` or pass as `--mode` is what
-> everyone plays. Clients send a `preferredMode` hint in the handshake and the
-> server deliberately ignores it — otherwise the first phone to connect (which
-> always asks for DM) would flip a TDM server to deathmatch and wipe the score.
+> **The game mode is still owned by the server — but the lobby gets a say.**
+> Clients send a `preferredMode` hint in the handshake that the server
+> deliberately ignores (otherwise the first phone to connect, which always asks
+> for DM, would flip a TDM server and wipe the score). The sanctioned way to
+> change the rules mid-session is the lobby's **MODE_VOTE** buttons (P3-4): a
+> strict majority of the connected humans voting the other way flips the mode
+> for exactly one match; with no majority the operator's `--mode` stays in
+> charge. The current tally rides along in every `LOBBY_STATE`.
 
 ---
 
@@ -257,8 +305,8 @@ scripts\build-release.bat         # Windows
 Or by hand:
 
 ```bash
-./gradlew :shared:test :server:test          # 59 JVM tests
-./gradlew :client-android:testDebugUnitTest  # 15 client-logic tests
+./gradlew :shared:test :server:test          # 101 JVM tests
+./gradlew :client-android:testDebugUnitTest  # 23 client tests
 ./gradlew :server:packageServer              # → release/server.zip
 ./gradlew :client-android:assembleRelease    # → release/lanfps-client-release.apk
 ```
@@ -275,22 +323,33 @@ regenerates it if it is missing.
 
 ### Test coverage
 
-74 tests, all green:
+124 tests, all green:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `shared.ProtocolTest` | 11 | header, CRC32, round-trips, truncation, quantisation |
+| `shared.ProtocolTest` | 13 | header, CRC32, round-trips, truncation, quantisation |
 | `shared.ArenaAndPhysicsTest` | 16 | arena hash, spawns, collision, determinism |
+| `shared.SnapshotDeltaTest` | 5 | DELTA snapshot encode/apply (P1-2) |
 | `server.PhysicsTest` | 8 | walls, gravity, jump, crouch headroom, bounds |
-| `server.RaycastTest` | 9 | line of sight, cover, range, teams, dead entities |
+| `server.RaycastTest` | 10 | line of sight, cover, range, teams, dead entities |
+| `server.WeaponsTest` | 13 | per-pellet bursts, walls vs shotgun, magazines, auto-reload, switching |
+| `server.MapsTest` | 5 | arena02/03 geometry, nav-graph connectivity, asset byte-parity |
+| `server.MatchFlowTest` | 5 | lobby mode votes, map rotation, team balance, password lock |
+| `server.ChaosNetworkTest` | 3 | 0–20 % loss, 0–120 ms latency, jitter + reordering through ChaosProxy |
 | `server.BotMatchTest` | 11 | nav graph, bot states, scoring, match end, post-match freeze |
-| `server.ConnectHandshakeTest` | 4 | real UDP handshake against a real server: mode, team, arena hash |
+| `server.ConnectHandshakeTest` | 6 | real UDP handshake: mode, team, arena hash, reconnect, flood throttle |
+| `server.LagCompensationTest` | 6 | rewind windows, event ack queues (P1-1/P1-4) |
 | `client.ClientLogicTest` | 15 | interpolation, freeze, reordering, prediction, reconciliation |
+| `client.NetworkClientTest` | 8 | handshake, input rate, rejection, kick, votes, events, lobby + snapshots |
 
 The client tests are the important ones for feel: they assert that
 `Prediction` reproduces the server simulation *exactly* over 30 ticks, that a
 partially acknowledged snapshot replays the unacknowledged tail onto the same
-spot, and that a 12 m disagreement snaps while a 0.2 m one is smoothed.
+spot, and that a 12 m disagreement snaps while a 0.2 m one is smoothed. The
+`ChaosNetworkTest` trio is the plan's P3-1 acceptance criteria made executable:
+through a proxy dropping and delaying datagrams both ways, the client still
+connects, snapshots keep arriving, the input stream converges and the server
+never crashes.
 
 ---
 
@@ -343,23 +402,18 @@ the game — which is exactly the point of running it.
 Deliberate scope choices, all in the name of "a simple working version beats a
 big half-finished one":
 
-* **One weapon.** A hitscan rifle: 25 damage, 8 rounds/s, infinite ammo (the HUD
-  shows `∞`). No reload, no weapon switching, no grenades.
-* **No sound.** Feedback is visual only — muzzle flash, tracers, damage flash,
-  kill feed. Vibration on hit is wired up and permission-declared.
-* **No lag compensation / rewind.** The server hit-tests against *present*
-  positions, not against what the shooter saw. On a LAN (1–5 ms) this is
-  imperceptible; over the internet it would need rewinding, which is out of
-  scope for a LAN game.
-* **No reliable-ordered channel.** Everything is unreliable UDP with sequence
-  numbers plus redundancy; match events are re-sent for a few ticks rather than
-  ACKed. Good enough for a switch, not for a lossy WAN link.
+* **Sound is procedural.** P1-3 synthesises gunshots/hits/jingles in code
+  (`SoundManager`) — tiny and asset-free, but it is a beeper, not an orchestra.
+* **No TCP-ordered side channel.** Reliability is targeted, not general:
+  `MATCH_EVENT`s are ACKed and re-sent until they land (P1-4), everything else
+  rides unreliable UDP with redundancy — the right trade for a LAN.
 * **IPv4 only**, single subnet. Broadcast discovery does not cross routers —
   typing the IP always works.
 * **No persistence.** Scores live for the length of a match; there are no
-  accounts, no stats and nothing written to disk.
-* **One map.** `arena01`. The format is data-driven, so adding another is a JSON
-  file plus a line in `server.properties`, but only one ships.
+  accounts, no stats and nothing written to disk on the phones. (The server can
+  append its own metrics to a CSV, `--statsCsv=stats.csv`.)
+* **English-only in-game UI.** The launcher label is localised (`values-ru`),
+  but the screens are built in code and their strings are not externalised yet.
 * **Landscape only**, minSdk 24, OpenGL ES 3.0+ required.
 
 ---

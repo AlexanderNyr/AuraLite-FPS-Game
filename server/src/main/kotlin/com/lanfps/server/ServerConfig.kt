@@ -56,6 +56,28 @@ class ServerConfig {
      *  instead of a full snapshot every 33 ms. */
     var deltaCompression: Boolean = true
 
+    // ---- P2: content -------------------------------------------------------
+    /** P2-2: false gives every weapon a magazine + reload pacing; true is the
+     *  original arena behaviour (HUD shows ∞). */
+    var infiniteAmmo: Boolean = false
+
+    /** P2-3: comma-separated arena files rotated between matches. Empty = the
+     *  single `arenaFile` is played forever (no rotation). */
+    var mapRotation: String = ""
+
+    /** P2-3: parsed [mapRotation] as a list of file names. */
+    fun mapRotationList(): List<String> =
+        mapRotation.split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+    /** P0-3 (optional): plain-text password; empty = open server (default). */
+    var password: String = ""
+
+    /** P3-3: path of a CSV file metrics are appended to every stats interval.
+     *  Empty = off. */
+    var statsCsv: String = ""
+
     var logLevel: String = "INFO"
 
     /** Headless smoke test: run N seconds of simulation then exit. 0 = normal run. */
@@ -93,6 +115,10 @@ class ServerConfig {
         p.getProperty("serverTimeoutMs")?.toLongOrNull()?.let { serverTimeoutMs = it }
         p.getProperty("lagCompensation")?.let { lagCompensation = it.trim().toBoolean() }
         p.getProperty("deltaCompression")?.let { deltaCompression = it.trim().toBoolean() }
+        p.getProperty("infiniteAmmo")?.let { infiniteAmmo = it.trim().toBoolean() }
+        p.getProperty("mapRotation")?.let { mapRotation = it.trim() }
+        p.getProperty("password")?.let { password = it.trim().take(32) }
+        p.getProperty("statsCsv")?.let { statsCsv = it.trim() }
         p.getProperty("logLevel")?.let { logLevel = it.trim() }
         p.getProperty("selfTestSeconds")?.toIntOrNull()?.let { selfTestSeconds = it }
     }

@@ -4,6 +4,7 @@ import com.lanfps.shared.GameConstants
 import com.lanfps.shared.InputButtons
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.Vec3
+import com.lanfps.shared.Weapons
 import java.util.Random
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -27,7 +28,6 @@ import kotlin.math.sqrt
 class BotAI(
     private val world: World,
     private val arena: ServerArena,
-    private val difficulty: Float,
     seed: Long = 0xB07L,
 ) {
     private val rng = Random(seed)
@@ -39,11 +39,12 @@ class BotAI(
     private val right = Vec3()
     private val tmp = Vec3()
 
-    // Difficulty-scaled behaviour knobs.
-    private val turnSpeedDeg = MathUtil.lerp(180f, 520f, difficulty)
-    private val maxAimErrorDeg = MathUtil.lerp(9f, 1.6f, difficulty)
-    private val reactionSeconds = MathUtil.lerp(0.55f, 0.12f, difficulty)
-    private val viewRange = MathUtil.lerp(32f, 55f, difficulty)
+    // P2-4: behaviour knobs are per-bot now ([BotEntity.skill]) — the config
+    // difficulty is only the mean assigned when bots are created.
+    private fun turnSpeedDeg(bot: BotEntity) = MathUtil.lerp(180f, 520f, bot.skill)
+    private fun maxAimErrorDeg(bot: BotEntity) = MathUtil.lerp(9f, 1.6f, bot.skill)
+    private fun reactionSeconds(bot: BotEntity) = MathUtil.lerp(0.55f, 0.12f, bot.skill)
+    private fun viewRange(bot: BotEntity) = MathUtil.lerp(32f, 55f, bot.skill)
 
     fun update(bot: BotEntity, dt: Float) {
         bot.stateTimer += dt
@@ -99,7 +100,7 @@ class BotAI(
     private fun acquireTarget(bot: BotEntity): GameEntity? {
         bot.eyePosition(eye)
         var best: GameEntity? = null
-        var bestDist = viewRange
+        var bestDist = viewRange(bot)
 
         for (e in world.entities.values) {
             if (e === bot || !e.alive) continue
@@ -121,7 +122,7 @@ class BotAI(
         if (target != null) {
             if (bot.targetId != target.id) {
                 bot.targetId = target.id
-                bot.reactionTimer = reactionSeconds
+                bot.reactionTimer = reactionSeconds(bot)
             }
             bot.hasLastKnown = true
             bot.lastKnownTargetPos.set(target.body.position)
@@ -157,6 +158,9 @@ class BotAI(
 
         val dist = bot.body.position.distanceTo(target.body.position)
 
+        // P2-1: pick the right tool for the range.
+        bot.input.weapon = weaponForRange(dist)
+
         // Hold a comfortable fighting distance.
         val approach = when {
             dist > PREFERRED_RANGE_MAX -> 1f
@@ -182,19 +186,59 @@ class BotAI(
         if (target == null) { bot.setState(BotState.SEEK_TARGET); return }
 
         target.eyePosition(targetEye)
-        aimAt(bot, targetEye, dt)
 
-        // Retreat while still returning fire occasionally.
-        bot.strafeTimer -= dt
-        if (bot.strafeTimer <= 0f) {
-            bot.strafeDir = if (rng.nextBoolean()) 1f else -1f
-            bot.strafeTimer = 0.4f + rng.nextFloat() * 0.6f
+        // P2-4: run for *actual* cover — a waypoint the target has no line of
+        // sight to — instead of just backpedalling into the open. The cover pick
+        // is refreshed when reached or about twice a second.
+        val coverPos = bot.coverWaypoint.takeIf { it >= 0 }?.let { arena.waypoint(it) }
+        val reachedCover = coverPos != null &&
+            bot.body.position.horizontalDistanceTo(coverPos) < 2.0f
+        if (bot.coverWaypoint < 0 || reachedCover || rng.nextFloat() < dt / 2.5f) {
+            bot.coverWaypoint = findCoverWaypoint(bot, targetEye)
         }
-        applyMove(bot, -1f, bot.strafeDir * STRAFE_AMOUNT)
+
+        if (bot.coverWaypoint >= 0 && !reachedCover) {
+            // Travel to cover: face the threat while the steering maps the
+            // world-space route onto the stick (see applyMove's EVADE branch).
+            navigateTowards(bot, arena.waypoint(bot.coverWaypoint), dt)
+            aimAt(bot, targetEye, dt)
+            applyMove(bot, 1f, 0f)
+        } else {
+            // In cover (or none found): hold and jink.
+            aimAt(bot, targetEye, dt)
+            bot.strafeTimer -= dt
+            if (bot.strafeTimer <= 0f) {
+                bot.strafeDir = if (rng.nextBoolean()) 1f else -1f
+                bot.strafeTimer = 0.4f + rng.nextFloat() * 0.6f
+            }
+            applyMove(bot, if (bot.coverWaypoint >= 0) 0f else -1f, bot.strafeDir * STRAFE_AMOUNT)
+        }
 
         if (bot.reactionTimer <= 0f && isAimedAt(bot, targetEye) && rng.nextFloat() < 0.4f) {
             bot.input.buttons = bot.input.buttons or InputButtons.FIRE
         }
+    }
+
+    /** P2-4: nearest waypoint that breaks line of sight to the enemy's eye. */
+    private fun findCoverWaypoint(bot: BotEntity, enemyEye: Vec3): Int {
+        var best = -1
+        var bestScore = Float.MAX_VALUE
+        for (i in 0 until arena.waypointCount) {
+            val wp = arena.waypoint(i)
+            tmp.set(wp.x, wp.y + 0.9f, wp.z)
+            // Only useful if the enemy cannot watch us there.
+            if (world.raycast.hasLineOfSight(tmp, enemyEye)) continue
+            val dist = bot.body.position.horizontalDistanceTo(wp)
+            // Prefer close cover, and routeable cover.
+            val from = arena.nearestWaypoint(bot.body.position)
+            if (!arena.hasRoute(from, i)) continue
+            val score = dist + rng.nextFloat() * 2f
+            if (score < bestScore) {
+                bestScore = score
+                best = i
+            }
+        }
+        return best
     }
 
     private fun actSeek(bot: BotEntity, dt: Float) {
@@ -273,7 +317,7 @@ class BotAI(
 
     /** Smoothly rotates the bot's view toward the given angles. */
     private fun turnToward(bot: BotEntity, desiredYaw: Float, desiredPitch: Float, dt: Float) {
-        val maxStep = turnSpeedDeg * dt
+        val maxStep = turnSpeedDeg(bot) * dt
         val dYaw = MathUtil.angleDeltaDeg(bot.input.yaw, desiredYaw)
         bot.input.yaw = MathUtil.wrapDegrees(
             bot.input.yaw + MathUtil.clamp(dYaw, -maxStep, maxStep),
@@ -331,7 +375,11 @@ class BotAI(
         var r = strafeAmount
 
         // When navigating, desiredDir holds the world direction we want to walk.
-        if (bot.state == BotState.PATROL || bot.state == BotState.SEEK_TARGET) {
+        // EVADE is included: the bot keeps its aim on the threat but still walks
+        // the route toward cover.
+        if (bot.state == BotState.PATROL || bot.state == BotState.SEEK_TARGET ||
+            bot.state == BotState.EVADE
+        ) {
             if (desiredDir.horizontalLength() > 1e-3f) {
                 f = desiredDir.dot(fwd) * abs(forwardAmount)
                 r = desiredDir.dot(right) * abs(forwardAmount) + strafeAmount
@@ -342,14 +390,41 @@ class BotAI(
         bot.input.moveRight = MathUtil.clamp(r, -1f, 1f)
     }
 
+    /** P2-1: arsenal by engagement range — sniper far, shotgun close, rifle mid. */
+    private fun weaponForRange(dist: Float): Int = when {
+        dist >= SNIPER_MIN_RANGE -> Weapons.SNIPER
+        dist <= SHOTGUN_MAX_RANGE -> Weapons.SHOTGUN
+        else -> Weapons.RIFLE
+    }
+
+    /**
+     * P2-4: hearing. A gunshot within [HEARING_RANGE] puts idle bots on the
+     * trail of the shooter (SEEK toward the source). Bots already in a fight,
+     * and teammates of the shooter in TDM, ignore it.
+     */
+    fun onShotFired(shooter: GameEntity) {
+        for (bot in world.bots) {
+            if (bot === shooter || !bot.alive) continue
+            if (world.areAllies(bot, shooter)) continue
+            if (bot.state == BotState.ATTACK) continue
+            val dist = bot.body.position.distanceTo(shooter.body.position)
+            if (dist > HEARING_RANGE) continue
+            bot.hasLastKnown = true
+            bot.lastKnownTargetPos.set(shooter.body.position)
+            if (bot.state != BotState.SEEK_TARGET && bot.state != BotState.EVADE) {
+                bot.setState(BotState.SEEK_TARGET)
+            }
+        }
+    }
+
     // ---- housekeeping -----------------------------------------------------
 
     private fun updateAimError(bot: BotEntity, dt: Float) {
         bot.aimErrorTimer -= dt
         if (bot.aimErrorTimer <= 0f) {
             bot.aimErrorTimer = 0.25f + rng.nextFloat() * 0.5f
-            bot.aimErrorYaw = (rng.nextFloat() * 2f - 1f) * maxAimErrorDeg
-            bot.aimErrorPitch = (rng.nextFloat() * 2f - 1f) * maxAimErrorDeg * 0.5f
+            bot.aimErrorYaw = (rng.nextFloat() * 2f - 1f) * maxAimErrorDeg(bot)
+            bot.aimErrorPitch = (rng.nextFloat() * 2f - 1f) * maxAimErrorDeg(bot) * 0.5f
         }
     }
 
@@ -375,5 +450,12 @@ class BotAI(
         private const val FIRE_CONE_DEG = 6.5f
         private const val STUCK_THRESHOLD = 0.6f
         private const val STUCK_DISTANCE = 0.01f
+
+        /** P2-4: a gunshot this far away (metres) can be heard by bots. */
+        private const val HEARING_RANGE = 30f
+
+        /** P2-1: range bands the bots use to pick a weapon. */
+        private const val SNIPER_MIN_RANGE = 24f
+        private const val SHOTGUN_MAX_RANGE = 8f
     }
 }

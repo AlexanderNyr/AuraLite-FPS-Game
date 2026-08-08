@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.view.MotionEvent
 import android.view.View
+import com.lanfps.shared.Weapons
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.min
@@ -46,7 +47,7 @@ class TouchControlsView(
     }
 
     // ---- pointer roles -----------------------------------------------------
-    private enum class Role { NONE, STICK, LOOK, FIRE, JUMP, CROUCH, SCORE, MENU }
+    private enum class Role { NONE, STICK, LOOK, FIRE, JUMP, CROUCH, SCORE, MENU, WEAPON, RELOAD }
 
     private val roles = HashMap<Int, Role>()
 
@@ -73,6 +74,8 @@ class TouchControlsView(
     private var fireCx = 0f; private var fireCy = 0f; private var fireR = 0f
     private var jumpCx = 0f; private var jumpCy = 0f; private var jumpR = 0f
     private var crouchCx = 0f; private var crouchCy = 0f; private var crouchR = 0f
+    private var weaponCx = 0f; private var weaponCy = 0f; private var weaponR = 0f
+    private var reloadCx = 0f; private var reloadCy = 0f; private var reloadR = 0f
     private var scoreCx = 0f; private var scoreCy = 0f; private var scoreR = 0f
     private var menuCx = 0f; private var menuCy = 0f; private var menuR = 0f
 
@@ -95,6 +98,16 @@ class TouchControlsView(
         crouchR = dp(37f)
         crouchCx = wf - dp(196f)
         crouchCy = hf - dp(66f)
+
+        // P2-1: weapon cycler, stacked above CROUCH (same thumb column).
+        weaponR = dp(32f)
+        weaponCx = wf - dp(196f)
+        weaponCy = hf - dp(160f)
+
+        // P2-2: reload, above JUMP and clear of the fire button.
+        reloadR = dp(30f)
+        reloadCx = wf - dp(86f)
+        reloadCy = hf - dp(320f)
 
         scoreR = dp(26f)
         scoreCx = wf - dp(44f)
@@ -168,6 +181,8 @@ class TouchControlsView(
             inside(x, y, fireCx, fireCy, fireR + dp(6f)) -> Role.FIRE
             inside(x, y, jumpCx, jumpCy, jumpR + dp(6f)) -> Role.JUMP
             inside(x, y, crouchCx, crouchCy, crouchR + dp(6f)) -> Role.CROUCH
+            inside(x, y, weaponCx, weaponCy, weaponR + dp(6f)) -> Role.WEAPON
+            inside(x, y, reloadCx, reloadCy, reloadR + dp(6f)) -> Role.RELOAD
             x < width * 0.46f -> Role.STICK
             else -> Role.LOOK
         }
@@ -220,6 +235,19 @@ class TouchControlsView(
             Role.SCORE -> {
                 scorePressed = true
                 onScoreboard?.invoke(true)
+            }
+
+            Role.WEAPON -> {
+                // P2-1: one tap cycles rifle -> shotgun -> sniper. The InputController
+                // latches the choice; the server adopts it next input packet.
+                input.cycleWeapon()
+                performHaptic()
+            }
+
+            Role.RELOAD -> {
+                // P2-2: queued for exactly one network tick (like jump).
+                input.reloadQueued = true
+                performHaptic()
             }
 
             Role.MENU -> onMenu?.invoke()
@@ -332,6 +360,12 @@ class TouchControlsView(
         drawButton(canvas, jumpCx, jumpCy, jumpR, jumpPressed, "JUMP", 226, 232, 240)
         // Crouch.
         drawButton(canvas, crouchCx, crouchCy, crouchR, crouchLatched, "CROUCH", 226, 232, 240)
+        // Weapon cycler shows the CURRENT pick (P2-1); reload is a tap (P2-2).
+        drawButton(
+            canvas, weaponCx, weaponCy, weaponR, false,
+            Weapons.byId(input.currentWeapon).shortName, 242, 163, 60,
+        )
+        drawButton(canvas, reloadCx, reloadCy, reloadR, false, "RLD", 226, 232, 240)
         // Scoreboard / menu.
         drawButton(canvas, scoreCx, scoreCy, scoreR, scorePressed, "TAB", 226, 232, 240)
         drawButton(canvas, menuCx, menuCy, menuR, false, "II", 226, 232, 240)

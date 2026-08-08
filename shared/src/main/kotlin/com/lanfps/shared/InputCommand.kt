@@ -30,11 +30,14 @@ class InputCommand {
     /** Bitmask of [InputButtons]. */
     @JvmField var buttons: Int = 0
 
+    /** Requested weapon, an id from [Weapons]. The server is authoritative:
+     *  invalid ids are sanitised back to [Weapons.DEFAULT]. */
     @JvmField var weapon: Int = 0
 
     val firePressed: Boolean get() = (buttons and InputButtons.FIRE) != 0
     val jumpPressed: Boolean get() = (buttons and InputButtons.JUMP) != 0
     val crouchPressed: Boolean get() = (buttons and InputButtons.CROUCH) != 0
+    val reloadPressed: Boolean get() = (buttons and InputButtons.RELOAD) != 0
 
     fun clear(): InputCommand {
         sequence = 0
@@ -78,6 +81,7 @@ class InputCommand {
         if (!pitch.isFinite()) pitch = 0f
         if (!moveForward.isFinite()) moveForward = 0f
         if (!moveRight.isFinite()) moveRight = 0f
+        if (!Weapons.isValid(weapon)) weapon = Weapons.DEFAULT
         return this
     }
 

@@ -27,7 +27,7 @@ import kotlin.math.sqrt
  * lost) the difference is absorbed into [errorOffset] and faded out over ~120 ms
  * instead of teleporting the camera.
  */
-class Prediction(private val arena: ArenaDef) {
+class Prediction(@Volatile private var arena: ArenaDef) {
 
     val body = BodyState()
     private val solver = MovementSolver()
@@ -62,6 +62,16 @@ class Prediction(private val arena: ArenaDef) {
         lastErrorMeters = 0f
         pendingCount = 0
         initialised = false
+    }
+
+    /**
+     * P2-3: swaps the map prediction runs against when the server rotates the
+     * arena. Everything pending is stale the moment the world changes — the
+     * server respawns everyone — so a full reset is the only honest move.
+     */
+    fun setArena(newArena: ArenaDef) {
+        arena = newArena
+        reset()
     }
 
     /** Places the body without prediction history (first snapshot, respawn). */

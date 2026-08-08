@@ -60,6 +60,11 @@ object Packets {
          *  reconnect tells the server to resume the same entity/score/team
          *  instead of creating a brand-new session. 0 = first connection. */
         @JvmField var resumeToken: Int = 0
+
+        /** P0-3 (optional): plain-text server password. Compared verbatim on
+         *  the server when `password=` is set in server.properties; a LAN
+         *  convenience lock, not cryptography. */
+        @JvmField var password: String = ""
     }
 
     fun writeConnectRequest(w: BinaryWriter, c: ConnectRequest) {
@@ -67,6 +72,7 @@ object Packets {
         w.writeU8(c.preferredMode)
         w.writeI64(c.clientTimeMs)
         w.writeI32(c.resumeToken)
+        w.writeString(c.password, 32)
     }
 
     fun readConnectRequest(r: BinaryReader): ConnectRequest {
@@ -75,6 +81,7 @@ object Packets {
         c.preferredMode = r.readU8()
         c.clientTimeMs = r.readI64()
         c.resumeToken = r.readI32()
+        c.password = r.readString()
         return c
     }
 
@@ -266,6 +273,14 @@ object Packets {
         @JvmField var botCount: Int = 0
         @JvmField var maxPlayers: Int = GameConstants.DEFAULT_MAX_PLAYERS
         @JvmField var matchTimeRemaining: Float = 0f
+
+        /** P2-6: shown in the lobby so players know the rules of the match. */
+        @JvmField var killLimit: Int = 0
+
+        /** P3-4: current MODE_VOTE tally (humans only). */
+        @JvmField var votesDm: Int = 0
+        @JvmField var votesTdm: Int = 0
+
         @JvmField var players: ArrayList<LobbyPlayer> = ArrayList()
     }
 
@@ -277,6 +292,9 @@ object Packets {
         w.writeU8(l.botCount)
         w.writeU8(l.maxPlayers)
         w.writeF32(l.matchTimeRemaining)
+        w.writeU16(MathUtil.clamp(l.killLimit, 0, 65535))
+        w.writeU8(MathUtil.clamp(l.votesDm, 0, 255))
+        w.writeU8(MathUtil.clamp(l.votesTdm, 0, 255))
         val n = if (l.players.size > 255) 255 else l.players.size
         w.writeU8(n)
         for (i in 0 until n) {
@@ -299,6 +317,9 @@ object Packets {
         out.botCount = r.readU8()
         out.maxPlayers = r.readU8()
         out.matchTimeRemaining = r.readF32()
+        out.killLimit = r.readU16()
+        out.votesDm = r.readU8()
+        out.votesTdm = r.readU8()
         val n = r.readU8()
         out.players.clear()
         for (i in 0 until n) {
@@ -351,4 +372,15 @@ object Packets {
         out.extra = r.readI32()
         return out
     }
+
+    // -------------------------------------------------------------- mode vote
+
+    /** P3-4: a lobby vote for the ruleset of the NEXT match. The server still
+     *  owns the default (`mode=` in server.properties); a clear majority of
+     *  the connected humans voting otherwise flips it for one match. */
+    fun writeModeVote(w: BinaryWriter, mode: Int) {
+        w.writeU8(mode)
+    }
+
+    fun readModeVote(r: BinaryReader): GameMode = GameMode.fromWire(r.readU8())
 }

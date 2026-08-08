@@ -60,12 +60,16 @@ private fun printUsage() {
         Options (also settable in server.properties next to the jar):
           --udpPort=7777           UDP port to listen on
           --bindAddress=0.0.0.0    interface to bind (0.0.0.0 = all)
-          --mode=DM|TDM            ruleset
+          --mode=DM|TDM            default ruleset (lobby votes can flip it per match)
           --botCount=4             number of AI opponents (0-16)
           --maxPlayers=8           human player slots
           --matchTimeSeconds=300   match length
           --killLimit=20           score limit
-          --botDifficulty=0.55     0.0 (easy) .. 1.0 (hard)
+          --botDifficulty=0.55     0.0 (easy) .. 1.0 (hard) - the mean bot skill
+          --infiniteAmmo=false     true = bottomless magazines (classic arena rules)
+          --mapRotation=a.json,b.json   rotate maps between matches (P2-3)
+          --password=              optional shared password; empty = open server
+          --statsCsv=stats.csv     append metrics every 10 s; empty = off
           --enableDiscovery=true   answer LAN broadcast discovery
           --logLevel=INFO          DEBUG | INFO | WARN | ERROR
           --selftest               simulate 15 s headless, then exit

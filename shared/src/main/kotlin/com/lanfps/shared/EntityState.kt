@@ -27,6 +27,13 @@ class EntityState {
     @JvmField var kills: Int = 0
     @JvmField var deaths: Int = 0
 
+    /** Current weapon (id from [Weapons]); drives the client view model and HUD. */
+    @JvmField var weapon: Int = Weapons.DEFAULT
+
+    /** Rounds left in the magazine, or [Weapons.AMMO_INFINITE] (255) when the
+     *  server runs with infinite ammo. Display-only for remote entities. */
+    @JvmField var ammo: Int = Weapons.AMMO_INFINITE
+
     @JvmField var flags: Int = 0
 
     /**
@@ -59,6 +66,7 @@ class EntityState {
         yaw = o.yaw; pitch = o.pitch
         vx = o.vx; vy = o.vy; vz = o.vz
         health = o.health; kills = o.kills; deaths = o.deaths
+        weapon = o.weapon; ammo = o.ammo
         flags = o.flags; name = o.name
         return this
     }
@@ -80,6 +88,8 @@ class EntityState {
         w.writeU8(MathUtil.clamp(health, 0, 255))
         w.writeU16(MathUtil.clamp(kills, 0, 65535))
         w.writeU16(MathUtil.clamp(deaths, 0, 65535))
+        w.writeU8(MathUtil.clamp(weapon, 0, 255))
+        w.writeU8(MathUtil.clamp(ammo, 0, 255))
         // NB: no name. See the field comment — names moved to LOBBY_STATE.
     }
 
@@ -96,6 +106,8 @@ class EntityState {
         health = r.readU8()
         kills = r.readU16()
         deaths = r.readU16()
+        weapon = r.readU8()
+        ammo = r.readU8()
         // NB: no name on the wire anymore (see the field comment). The client
         // fills it from the LOBBY_STATE roster.
         return this
@@ -110,8 +122,8 @@ class EntityState {
         const val FLAG_FIRING: Int = 1 shl 1
         const val FLAG_CROUCH: Int = 1 shl 2
 
-        /** Fixed part of the wire size; the nickname adds 1 + len bytes. */
-        const val WIRE_SIZE_FIXED: Int = 2 + 1 + 1 + 1 + 12 + 8 + 6 + 1 + 2 + 2
+        /** Fixed part of the wire size (no nickname on the wire since P0-1). */
+        const val WIRE_SIZE_FIXED: Int = 2 + 1 + 1 + 1 + 12 + 8 + 6 + 1 + 2 + 2 + 1 + 1
 
         private fun quantiseVelocity(v: Float): Int =
             MathUtil.clamp((v * 100f).toInt(), -32768, 32767)

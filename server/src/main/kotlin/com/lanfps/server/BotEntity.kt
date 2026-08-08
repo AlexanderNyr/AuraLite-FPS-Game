@@ -43,6 +43,13 @@ class BotEntity(id: Int, botName: String) : GameEntity(id) {
     /** Synthesised each tick by [BotAI]. */
     @JvmField val input: InputCommand = InputCommand()
 
+    /**
+     * P2-4: this bot's individual skill 0..1. The server config's
+     * `botDifficulty` is the *mean*; each bot gets a fixed random-ish offset so
+     * a match mixes sharp and sloppy opponents instead of clones.
+     */
+    @JvmField var skill: Float = 0.55f
+
     @JvmField var state: BotState = BotState.PATROL
     @JvmField var stateTimer: Float = 0f
 
@@ -63,6 +70,9 @@ class BotEntity(id: Int, botName: String) : GameEntity(id) {
     @JvmField var stuckTimer: Float = 0f
     @JvmField val lastPosition: Vec3 = Vec3()
 
+    /** P2-4: waypoint the bot is currently hiding behind while EVADE-ing. */
+    @JvmField var coverWaypoint: Int = -1
+
     /** Slowly drifting aim error, refreshed by [aimErrorTimer]. */
     @JvmField var aimErrorYaw: Float = 0f
     @JvmField var aimErrorPitch: Float = 0f
@@ -77,6 +87,7 @@ class BotEntity(id: Int, botName: String) : GameEntity(id) {
         goalWaypoint = -1
         stuckTimer = 0f
         reactionTimer = 0f
+        coverWaypoint = -1
         lastPosition.set(spawn.position)
         input.clear()
         input.yaw = spawn.yaw

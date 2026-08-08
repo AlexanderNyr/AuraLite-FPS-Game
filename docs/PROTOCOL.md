@@ -17,7 +17,7 @@ Every datagram, in both directions:
 offset  size  field
 ------  ----  ------------------------------------------------------------
   0      4    magic            0x4C414E46  ("LANF")
-  4      1    protocolVersion  currently 2
+  4      1    protocolVersion  currently 3
   5      1    packetType       see §2
   6      2    sequence         u16, wraps; sender-local
   8      2    ack              u16, newest sequence seen from the peer
@@ -39,7 +39,7 @@ A packet is **silently dropped** — never fatally — when any of these fail:
 | length < 16 | `TOO_SHORT` |
 | length > 10240 | `TOO_LARGE` |
 | magic ≠ `LANF` | `BAD_MAGIC` |
-| version ≠ 1 | `BAD_VERSION` |
+| version ≠ 3 | `BAD_VERSION` |
 | 16 + payloadLength > length | `BAD_LENGTH` |
 | CRC32 mismatch | `BAD_CHECKSUM` |
 
@@ -78,6 +78,7 @@ cannot make a decoder read into neighbouring buffer contents.
 | 10 | `DISCONNECT` | either |
 | 11 | `LOBBY_STATE` | server → client |
 | 12 | `MATCH_EVENT` | server → client |
+| 13 | `MODE_VOTE` | client → server |
 
 ---
 
@@ -111,6 +112,7 @@ string nickname         <= 16 characters
 u8     preferredMode    advisory only; the server decides
 i64    clientTimeMs
 i32    resumeToken      0 = new connection, else resume this session
+string password         <= 32 characters; optional server door lock (P0-3)
 ```
 
 `resumeToken` is the token the server handed out in `CONNECT_ACCEPTED`. A
@@ -123,10 +125,15 @@ a brand-new connection.
 (`server.properties` / `run-server.bat --mode=TDM`); a connecting client can
 never change it. The current client always sends `DM` here, so honouring the
 field would silently turn every TDM server into a deathmatch — and reset the
-scores — the moment the first phone joined. The field stays on the wire so the
-packet layout is stable and a future "vote for mode" feature has somewhere to
-live. Read the authoritative mode from `CONNECT_ACCEPTED.mode` and from every
-snapshot's `mode` field.
+scores — the moment the first phone joined. The sanctioned way for clients to
+influence the mode is the lobby vote, `MODE_VOTE` (§3.11). Read the
+authoritative mode from `CONNECT_ACCEPTED.mode` and from every snapshot's
+`mode` field.
+
+`password` is compared verbatim against the server's `password=` setting (empty
+there means no check). A mismatch is answered with
+`CONNECT_REJECTED "Wrong password"`. It is a courtesy lock for a private LAN
+game, not cryptography — anyone who can read this document can read the config.
 
 ### 3.4 `CONNECT_ACCEPTED` (4)
 
@@ -238,7 +245,7 @@ they are safe even as different clients are on different keyframes. A lost
 datagram only costs until the next keyframe (≤ 1 s). `deltaCompression` in
 `server.properties` turns this off (always FULL).
 
-`EntityState`:
+`EntityState` (38 bytes fixed since v3):
 
 ```
 u16    id
@@ -251,7 +258,15 @@ i16    vx, vy, vz      velocity quantised to 1/100 m/s
 u8     health          0..100
 u16    kills
 u16    deaths
+u8     weapon          0 RIFLE, 1 SHOTGUN, 2 SNIPER (P2-1)
+u8     ammo            rounds left; 255 = bottomless magazine (P2-2)
 ```
+
+`weapon`/`ammo` (added in protocol v3) drive the HUD, the view model and the
+tracer patterns client-side; authoritative values live only on the server. The
+per-weapon numbers (damage, pellets, spread, rate, magazine, reload, range,
+recoil) are compiled into both sides via `shared/WeaponDef.kt`, so they are not
+on the wire.
 
 **No nickname in snapshots (P0-1).** Sending the name with every entity in every
 30 Hz snapshot could push a full server past the UDP MTU — especially with
@@ -295,6 +310,9 @@ u8     matchState
 u8     botCount
 u8     maxPlayers
 f32    matchTimeRemaining
+u16    killLimit         v3: the rules of the match, for the lobby + HUD (P2-6)
+u8     votesDm           v3: MODE_VOTE tally, humans only (P3-4)
+u8     votesTdm
 u8     playerCount
        playerCount x {
            u16    id
@@ -316,8 +334,17 @@ u16    killerId
 u16    victimId
 string killerName
 string victimName
-i32    extra        winning team for MATCH_END
+i32    extra        winning team for MATCH_END; mode wire id for MATCH_START
 ```
+
+For `MATCH_START` the event doubles as the **map-rotation announcement** (P2-3,
+v3): `killerName` carries the arena *name* (`arena02`) and `victimName` the
+arena *hash* formatted as `0x%08X` — the kill-feed meaning of those fields is
+unused on this event type. A client whose current map differs hot-loads
+`<name>.json` from its own assets, verifies the hash, and rebuilds prediction,
+raycasts and the render mesh before the first snapshot of the new match
+surfaces. Missing or mismatched maps fall back to the old geometry plus the
+`! map mismatch !` banner — never to a silent desync.
 
 **Reliable delivery (P1-4).** `MATCH_EVENT` is not a fire-and-forget broadcast.
 Each event gets a unique `eventSeq`; the server re-sends every unacknowledged
@@ -325,6 +352,20 @@ event on each snapshot cycle until the client acknowledges it. The client acks
 its **newest processed event sequence** in the **header `ack`** field of every
 `CLIENT_INPUT` (the field that was previously unused there). The client drops
 duplicates by `eventSeq`, so a re-sent event is never applied twice.
+
+### 3.11 `MODE_VOTE` (13)
+
+```
+u8     mode            0 DM, 1 TDM
+```
+
+The lobby's vote for the ruleset of the **next** match (P3-4, v3). The server
+remembers the latest vote per human session and re-evaluates it at every match
+reset: a mode wins when a **strict majority of the currently connected humans**
+votes for it (ties and indecision keep the operator's `mode=`). The running
+tally is broadcast in every `LOBBY_STATE` (`votesDm` / `votesTdm`), and the
+winning mode applies to exactly one match — the config stays the default for
+the one after unless the majority persists.
 
 ---
 

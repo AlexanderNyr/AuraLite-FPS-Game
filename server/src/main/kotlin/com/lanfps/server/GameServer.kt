@@ -1,5 +1,6 @@
 package com.lanfps.server
 
+import com.lanfps.shared.ArenaDef
 import com.lanfps.shared.BinaryReader
 import com.lanfps.shared.BinaryWriter
 import com.lanfps.shared.GameConstants
@@ -11,7 +12,6 @@ import com.lanfps.shared.Packets
 import com.lanfps.shared.Protocol
 import com.lanfps.shared.ProtocolException
 import java.net.InetAddress
-import java.util.ArrayDeque
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.locks.LockSupport
 
@@ -26,18 +26,36 @@ import java.util.concurrent.locks.LockSupport
  *
  * The simulation never blocks on I/O, and simulation speed is independent of how
  * fast the loop happens to spin.
+ *
+ * Session bookkeeping (flood protection, zombies, reconnects) lives in
+ * [SessionManager] — extracted in P3-4; this class keeps the protocol, the tick
+ * loop, map rotation (P2-3), lobby votes (P3-4) and metrics (P3-3).
  */
 class GameServer(private val config: ServerConfig) {
 
     private lateinit var socket: UdpServerSocket
-    private lateinit var serverArena: ServerArena
     private lateinit var world: World
     private lateinit var match: MatchController
 
     private val snapshotBuilder = SnapshotBuilder()
+    private val sessionManager = SessionManager(config)
 
     /** Sessions keyed by "ip:port" — the identity of a UDP peer. */
-    private val sessions = LinkedHashMap<String, ClientSession>()
+    private val sessions: LinkedHashMap<String, ClientSession>
+        get() = sessionManager.sessions
+
+    // ---- P2-3: map rotation -------------------------------------------------
+    private var arenaRotation: List<ArenaDef> = emptyList()
+    private var rotationIndex = 0
+
+    // ---- P3-4: mode votes (player id -> desired mode) ----------------------
+    private val modeVotes = HashMap<Int, GameMode>()
+
+    // ---- P3-3: observability ------------------------------------------------
+    /** Rolling reservoir of simulation-batch durations (nanos). */
+    private val tickDurations = LongArray(TICK_METRIC_CAP)
+    private var tickDurationCount = 0
+    private var statsCsv: java.io.PrintWriter? = null
 
     private var nextPlayerId = 1
 
@@ -59,33 +77,48 @@ class GameServer(private val config: ServerConfig) {
     private var tickCount = 0
     private var ticksThisSecond = 0
     private var rejectedPackets = 0L
-    private var rejectedConnects = 0L
-
-    // ---- P0-3: connection flood protection --------------------------------
-    // Timestamps of recently accepted brand-new connects, for a sliding 1 s
-    // window (global and per-IP). The simulation thread is single-threaded so
-    // no locking is needed.
-    private val recentConnectTimes = ArrayDeque<Long>()
-    private val recentConnectPerIp = HashMap<String, ArrayDeque<Long>>()
-    private val connectWindowMs = 1000L
 
     private fun serverTimeMs(): Long = (System.nanoTime() - startNanos) / 1_000_000L
 
     // ---------------------------------------------------------------- startup
 
     fun start() {
-        val arenaDef = ArenaLoader.load(config.arenaFile)
-        serverArena = ServerArena(arenaDef)
+        arenaRotation = loadRotation()
+        rotationIndex = 0
+        val arenaDef = arenaRotation[rotationIndex]
+        val serverArena = ServerArena(arenaDef)
         world = World(serverArena, config)
-        match = MatchController(world, config)
+        match = MatchController(
+            world, config,
+            voteWinner = ::voteWinner,
+            nextArena = ::nextArenaDef,
+        )
         world.setBotCount(config.botCount)
 
         socket = UdpServerSocket(config.bindAddress, config.udpPort)
         socket.bind()
         running = true
 
+        openStatsCsvIfConfigured()
         printBanner(arenaDef.describe())
         runLoop()
+    }
+
+    /** P2-3: loads the configured map list (single map = no rotation). */
+    private fun loadRotation(): List<ArenaDef> {
+        val names = config.mapRotationList().ifEmpty { listOf(config.arenaFile) }
+        val defs = names.map { ArenaLoader.load(it) }
+        if (defs.size > 1) {
+            Log.info("map rotation enabled: " + defs.joinToString(" -> ") { it.name })
+        }
+        return defs
+    }
+
+    /** P2-3 packaged into the MatchController hook. Null = stay on this map. */
+    private fun nextArenaDef(): ArenaDef? {
+        if (arenaRotation.size < 2) return null
+        rotationIndex = (rotationIndex + 1) % arenaRotation.size
+        return arenaRotation[rotationIndex]
     }
 
     private fun printBanner(arenaDescription: String) {
@@ -95,12 +128,12 @@ class GameServer(private val config: ServerConfig) {
         Log.raw("  =============================================================")
         Log.info("listening on ${config.bindAddress}:${config.udpPort} (UDP)")
         Log.info("protocolVersion=${GameConstants.PROTOCOL_VERSION}")
-        Log.info("arena=${config.arenaName}")
+        Log.info("arena=${world.serverArena.def.name}")
         Log.info("mode=${world.mode.name}")
         Log.info("tickRate=${GameConstants.TICK_RATE}Hz snapshotRate=${GameConstants.SNAPSHOT_RATE}Hz")
         Log.info(config.describe())
         Log.info(arenaDescription)
-        Log.info(serverArena.describeGraph())
+        Log.info(world.serverArena.describeGraph())
         Log.info("bots spawned: ${world.bots.size}")
 
         val ips = UdpServerSocket.localIpv4Addresses()
@@ -149,15 +182,19 @@ class GameServer(private val config: ServerConfig) {
 
             drainInbound()
 
-            while (accumulator >= GameConstants.TICK_NANOS) {
-                // Guns are hot only during a live match, so the final score can
-                // never drift away from the result we just announced.
-                world.combatEnabled = match.isActive
-                world.tick(GameConstants.TICK_DT)
-                match.update(GameConstants.TICK_DT)
-                accumulator -= GameConstants.TICK_NANOS
-                tickCount++
-                ticksThisSecond++
+            if (accumulator >= GameConstants.TICK_NANOS) {
+                val simStart = System.nanoTime()
+                while (accumulator >= GameConstants.TICK_NANOS) {
+                    // Guns are hot only during a live match, so the final score can
+                    // never drift away from the result we just announced.
+                    world.combatEnabled = match.isActive
+                    world.tick(GameConstants.TICK_DT)
+                    match.update(GameConstants.TICK_DT)
+                    accumulator -= GameConstants.TICK_NANOS
+                    tickCount++
+                    ticksThisSecond++
+                }
+                recordTickDuration(System.nanoTime() - simStart)
             }
 
             if (snapshotAccum >= GameConstants.SNAPSHOT_INTERVAL_NANOS) {
@@ -233,6 +270,7 @@ class GameServer(private val config: ServerConfig) {
             PacketTypes.DISCOVERY_REQUEST -> handleDiscovery(p)
             PacketTypes.CONNECT_REQUEST -> handleConnect(p, nowMs)
             PacketTypes.CLIENT_INPUT -> handleInput(p, nowMs)
+            PacketTypes.MODE_VOTE -> handleModeVote(p, nowMs)
             PacketTypes.PING -> handlePing(p, nowMs)
             PacketTypes.PONG -> handlePong(p)
             PacketTypes.DISCONNECT -> handleDisconnect(p)
@@ -244,7 +282,7 @@ class GameServer(private val config: ServerConfig) {
         if (!config.enableDiscovery) return
         val info = Packets.DiscoveryResponse().apply {
             serverName = config.serverName
-            arena = config.arenaName
+            arena = world.serverArena.def.name
             mode = world.mode.wire
             playerCount = sessions.size
             maxPlayers = config.maxPlayers
@@ -264,12 +302,12 @@ class GameServer(private val config: ServerConfig) {
 
         // Re-sending CONNECT_REQUEST is normal when the accept was lost: reply
         // again with the same identity instead of creating a duplicate session.
-        val existing = sessions[key]
+        val existing = sessionManager.byKey(key)
         if (existing != null) {
             existing.touch(nowMs)
             // If this was a silent zombie, the mere fact it is talking again means
             // it reconnected on the same socket - bring it back to life.
-            reactivateIfZombie(existing)
+            sessionManager.reactivateIfZombie(existing)
             sendConnectAccepted(existing)
             Log.debug("re-accepted ${existing.nickname} from $key")
             return
@@ -279,18 +317,9 @@ class GameServer(private val config: ServerConfig) {
         // session holds the matching token, re-bind it under the new endpoint
         // and hand back the same id/score/team instead of a fresh session.
         if (request.resumeToken != 0) {
-            val zombie = sessions.values.firstOrNull {
-                it.resumeToken == request.resumeToken && it.zombie
-            }
+            val zombie = sessionManager.findZombieByToken(request.resumeToken)
             if (zombie != null) {
-                sessions.remove(zombie.key)
-                zombie.key = key
-                zombie.address = p.address
-                zombie.port = p.port
-                zombie.touch(nowMs)
-                zombie.zombie = false
-                zombie.zombieDeadlineMs = 0
-                sessions[key] = zombie
+                sessionManager.rebind(zombie, p.address, p.port, nowMs)
                 sendConnectAccepted(zombie)
                 Log.info(
                     "RECONNECT '${zombie.nickname}' id=${zombie.id} via token from $key " +
@@ -302,21 +331,30 @@ class GameServer(private val config: ServerConfig) {
 
         // P0-3: flood protection. New sessions are rate-limited before we spend
         // any CPU or hand out a slot.
-        if (!allowConnect(p.address)) {
-            rejectedConnects++
+        if (!sessionManager.allowConnect(p.address, nowMs)) {
+            sessionManager.rejectedConnects++
             reject(p.address, p.port, "Connection rate limited - please retry in a moment")
             Log.warn("rejected connection from $key: rate limited")
             return
         }
-        if (countSessionsForIp(p.address) >= config.maxSessionsPerIp) {
-            rejectedConnects++
+        if (sessionManager.countSessionsForIp(p.address) >= config.maxSessionsPerIp) {
+            sessionManager.rejectedConnects++
             reject(p.address, p.port, "Too many connections from this device/network")
             Log.warn("rejected connection from $key: too many sessions for this IP")
             return
         }
 
+        // P0-3 (optional): a plain-text shared password for a private LAN game.
+        // Compared verbatim - this is a door lock, not cryptography.
+        if (config.password.isNotEmpty() && request.password != config.password) {
+            sessionManager.rejectedConnects++
+            reject(p.address, p.port, "Wrong password")
+            Log.info("rejected connection from $key: wrong password")
+            return
+        }
+
         if (sessions.size >= config.maxPlayers) {
-            rejectedConnects++
+            sessionManager.rejectedConnects++
             reject(p.address, p.port, "Server is full (${config.maxPlayers} players)")
             Log.info("rejected connection from $key: server full")
             return
@@ -326,7 +364,8 @@ class GameServer(private val config: ServerConfig) {
         // `run-server.bat --mode=TDM`. `preferredMode` in the request is only an
         // advisory hint and is deliberately ignored - otherwise the first phone
         // to connect (which always asks for DM) would silently turn a TDM server
-        // into a deathmatch and reset the scores.
+        // into a deathmatch and reset the scores. The MODE_VOTE packet (P3-4)
+        // is the sanctioned way for clients to influence the mode.
         val requestedMode = GameMode.fromWire(request.preferredMode)
         if (requestedMode != world.mode) {
             Log.debug(
@@ -343,7 +382,7 @@ class GameServer(private val config: ServerConfig) {
         session.resumeToken = ThreadLocalRandom.current().nextInt(1, Int.MAX_VALUE)
         session.serverTimeoutMs = config.serverTimeoutMs
         session.touch(nowMs)
-        sessions[key] = session
+        sessionManager.register(session)
 
         val player = world.addPlayer(session)
         sendConnectAccepted(session)
@@ -367,12 +406,12 @@ class GameServer(private val config: ServerConfig) {
             playerId = session.id
             team = entity?.team?.wire ?: 0
             mode = world.mode.wire
-            arena = config.arenaName
+            arena = world.serverArena.def.name
             tickRate = GameConstants.TICK_RATE
             snapshotRate = GameConstants.SNAPSHOT_RATE
             serverTimeMs = serverTimeMs()
             assignedNickname = session.nickname
-            arenaHash = serverArena.def.hash()
+            arenaHash = world.serverArena.def.hash()
             resumeToken = session.resumeToken
         }
         Protocol.begin(writer, PacketTypes.CONNECT_ACCEPTED)
@@ -391,7 +430,7 @@ class GameServer(private val config: ServerConfig) {
             return
         }
         session.touch(nowMs)
-        reactivateIfZombie(session)
+        sessionManager.reactivateIfZombie(session)
 
         // P1-4: the client's ack is the newest MATCH_EVENT sequence it processed;
         // drop every event up to and including it from the resend queue.
@@ -406,12 +445,43 @@ class GameServer(private val config: ServerConfig) {
         session.enqueueInputs(inputPacket.commands)
     }
 
+    /** P3-4: a lobby vote for the ruleset of the NEXT match. */
+    private fun handleModeVote(p: InboundPacket, nowMs: Long) {
+        val key = ClientSession.endpointKey(p.address, p.port)
+        val session = sessions[key] ?: return
+        session.touch(nowMs)
+        val mode = Packets.readModeVote(reader)
+        modeVotes[session.id] = mode
+        Log.debug(
+            "mode vote: '${session.nickname}' -> ${mode.name} " +
+                "(tally DM=${votesFor(GameMode.DM)} TDM=${votesFor(GameMode.TDM)})",
+        )
+    }
+
+    private fun votesFor(mode: GameMode): Int = modeVotes.values.count { it == mode }
+
+    /**
+     * The lobby's pick for the next match (P3-4): a strict majority of the
+     * connected humans voting for one mode. Null keeps the operator's config,
+     * which also protects a server full of undecided players from flip-flops.
+     */
+    private fun voteWinner(): GameMode? {
+        if (modeVotes.isEmpty()) return null
+        val dm = votesFor(GameMode.DM)
+        val tdm = votesFor(GameMode.TDM)
+        if (dm == tdm) return null
+        val top = maxOf(dm, tdm)
+        // Need a strict majority of the humans currently online.
+        if (top <= sessions.size / 2) return null
+        return if (dm > tdm) GameMode.DM else GameMode.TDM
+    }
+
     private fun handlePing(p: InboundPacket, nowMs: Long) {
         val clientTime = Packets.readPing(reader)
         val session = sessions[ClientSession.endpointKey(p.address, p.port)]
         if (session != null) {
             session.touch(nowMs)
-            reactivateIfZombie(session)
+            sessionManager.reactivateIfZombie(session)
         }
 
         Protocol.begin(writer, PacketTypes.PONG)
@@ -421,8 +491,8 @@ class GameServer(private val config: ServerConfig) {
 
     /**
      * P1-1: server side of the RTT measurement. The server sends each session a
-     * PING every second; the client answers with PONG (already implemented in
-     * NetworkClient.rxLoop), and we time the round trip here.
+     * PING every second; the client answers with PONG, and we time the round
+     * trip here. Samples also feed the P3-3 percentile metrics.
      */
     private fun handlePong(p: InboundPacket) {
         val pong = Packets.Pong()
@@ -436,6 +506,7 @@ class GameServer(private val config: ServerConfig) {
                 } else {
                     session.smoothedRttMs + (rtt - session.smoothedRttMs) * 0.25
                 }
+                session.addRttSample(rtt)
             }
         }
     }
@@ -455,7 +526,8 @@ class GameServer(private val config: ServerConfig) {
 
     private fun handleDisconnect(p: InboundPacket) {
         val key = ClientSession.endpointKey(p.address, p.port)
-        val session = sessions.remove(key) ?: return
+        val session = sessionManager.remove(key) ?: return
+        modeVotes.remove(session.id)
         world.removeEntity(session.id)
         Log.info("DISCONNECT '${session.nickname}' id=${session.id} (client requested)")
         match.pendingEvents.add(
@@ -468,50 +540,16 @@ class GameServer(private val config: ServerConfig) {
     }
 
     private fun checkTimeouts() {
-        val nowMs = System.currentTimeMillis()
-        val iterator = sessions.entries.iterator()
-        while (iterator.hasNext()) {
-            val session = iterator.next().value
-            if (!session.isTimedOut(nowMs)) continue
-
-            if (!session.zombie) {
-                // P0-2: first silence timeout turns the session into a zombie.
-                // We deliberately KEEP the entity in the world (standing still,
-                // still shootable) so its score/team are preserved for a
-                // reconnect with the resume token.
-                session.zombie = true
-                session.zombieDeadlineMs = nowMs + config.zombieTimeoutMs
-                Log.info(
-                    "TIMEOUT '${session.nickname}' id=${session.id} -> zombie for " +
-                        "${config.zombieTimeoutMs} ms (awaiting reconnect)",
-                )
-            } else if (nowMs >= session.zombieDeadlineMs) {
-                iterator.remove()
-                world.removeEntity(session.id)
-                Log.info(
-                    "ZOMBIE EXPIRED '${session.nickname}' id=${session.id} - slot reclaimed",
-                )
-                match.pendingEvents.add(
-                    Packets.MatchEvent().apply {
-                        eventType = MatchEventType.PLAYER_LEFT
-                        killerId = session.id
-                        killerName = session.nickname
-                    },
-                )
-            }
-        }
-        pruneConnectWindows(nowMs)
-    }
-
-    // ---- P0-2/P0-3 helpers --------------------------------------------------
-
-    /** Clears the zombie flag on a session that just sent a packet again. */
-    private fun reactivateIfZombie(session: ClientSession) {
-        if (session.zombie) {
-            session.zombie = false
-            session.zombieDeadlineMs = 0
-            Log.info(
-                "session '${session.nickname}' id=${session.id} re-activated from zombie",
+        val expired = sessionManager.sweepTimeouts(System.currentTimeMillis())
+        for (session in expired) {
+            modeVotes.remove(session.id)
+            world.removeEntity(session.id)
+            match.pendingEvents.add(
+                Packets.MatchEvent().apply {
+                    eventType = MatchEventType.PLAYER_LEFT
+                    killerId = session.id
+                    killerName = session.nickname
+                },
             )
         }
     }
@@ -521,40 +559,6 @@ class GameServer(private val config: ServerConfig) {
         Protocol.begin(writer, PacketTypes.CONNECT_REJECTED)
         Packets.writeConnectRejected(writer, reason)
         socket.send(writer.buffer, Protocol.end(writer), address, port)
-    }
-
-    /** P0-3: checks the global + per-IP sliding-window connect limits. */
-    private fun allowConnect(address: InetAddress): Boolean {
-        val now = System.currentTimeMillis()
-        val ip = address.hostAddress
-        pruneQueue(recentConnectTimes, now)
-        if (recentConnectTimes.size >= config.maxConnectsPerSecond) return false
-
-        val perIp = recentConnectPerIp.getOrPut(ip) { ArrayDeque() }
-        pruneQueue(perIp, now)
-        if (perIp.size >= config.maxConnectsPerIpPerSecond) return false
-
-        recentConnectTimes.addLast(now)
-        perIp.addLast(now)
-        return true
-    }
-
-    /** How many sessions (including zombies) are active for a source IP. */
-    private fun countSessionsForIp(address: InetAddress): Int =
-        sessions.values.count { it.address.hostAddress == address.hostAddress }
-
-    private fun pruneQueue(q: ArrayDeque<Long>, now: Long) {
-        while (q.isNotEmpty() && now - q.first() >= connectWindowMs) q.removeFirst()
-    }
-
-    /** Drops empty per-IP windows so the map cannot grow without bound. */
-    private fun pruneConnectWindows(now: Long) {
-        val it = recentConnectPerIp.entries.iterator()
-        while (it.hasNext()) {
-            val e = it.next()
-            pruneQueue(e.value, now)
-            if (e.value.isEmpty()) it.remove()
-        }
     }
 
     // ------------------------------------------------------------- outbound
@@ -607,12 +611,16 @@ class GameServer(private val config: ServerConfig) {
         if (sessions.isEmpty()) return
         val lobby = Packets.LobbyState().apply {
             serverName = config.serverName
-            arena = config.arenaName
+            arena = world.serverArena.def.name
             mode = world.mode.wire
             matchState = match.state
             botCount = world.bots.size
             maxPlayers = config.maxPlayers
             matchTimeRemaining = match.timeRemaining
+            // P2-6: the lobby shows the rules; P3-4: the vote tally.
+            killLimit = config.killLimit
+            votesDm = votesFor(GameMode.DM)
+            votesTdm = votesFor(GameMode.TDM)
         }
         for (e in world.score.standings(world.entities.values)) {
             lobby.players.add(
@@ -635,17 +643,53 @@ class GameServer(private val config: ServerConfig) {
         }
     }
 
+    // ---- P3-3: metrics ------------------------------------------------------
+
+    private fun recordTickDuration(nanos: Long) {
+        tickDurations[(tickDurationCount++) % TICK_METRIC_CAP] = nanos
+    }
+
+    private fun tickPercentileUs(p: Double): Long {
+        val n = minOf(tickDurationCount, TICK_METRIC_CAP)
+        if (n == 0) return 0L
+        val copy = LongArray(n) { tickDurations[it] }
+        copy.sort()
+        return copy[((n - 1) * p).toInt()] / 1_000L
+    }
+
+    private fun openStatsCsvIfConfigured() {
+        val path = config.statsCsv.trim()
+        if (path.isEmpty()) return
+        try {
+            val file = java.io.File(path)
+            val needsHeader = !file.exists() || file.length() == 0L
+            statsCsv = java.io.PrintWriter(java.io.FileWriter(file, true), true)
+            if (needsHeader) {
+                statsCsv?.println(
+                    "epochMs,tps,tickP50us,tickP95us,tickP99us,players,bots," +
+                        "rxPackets,txPackets,rejected,rejectedConnects,snapPeakBytes",
+                )
+            }
+            Log.info("writing server metrics to ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.warn("could not open --statsCsv file '$path': $e")
+            statsCsv = null
+        }
+    }
+
     private fun logStats() {
         val tps = ticksThisSecond / (STATS_INTERVAL_NANOS / 1_000_000_000L)
         ticksThisSecond = 0
         Log.info(
             "stats: players=${sessions.size} bots=${world.bots.size} " +
                 "tick=$tickCount (~${tps}/s) " +
+                "tickP50=${tickPercentileUs(0.50)}us P95=${tickPercentileUs(0.95)}us " +
+                "P99=${tickPercentileUs(0.99)}us " +
                 "state=${MatchState.name(match.state)} " +
                 "time=${match.timeRemaining.toInt()}s " +
                 "score[${world.scoreSummary()}] " +
                 "rx=${socket.packetsReceived.get()} tx=${socket.packetsSent.get()} " +
-                "rejected=$rejectedPackets rejectedConnects=$rejectedConnects " +
+                "rejected=$rejectedPackets rejectedConnects=${sessionManager.rejectedConnects} " +
                 "zombies=${sessions.values.count { it.zombie }} " +
                 "snapPeak=${snapshotBuilder.peakSize}B",
         )
@@ -653,11 +697,30 @@ class GameServer(private val config: ServerConfig) {
             Log.debug(
                 "  ${session.nickname}: ping=${session.reportedPingMs}ms " +
                     "serverRtt=${session.smoothedRttMs.toInt()}ms " +
+                    "rttP95=${session.rttP95().toInt()}ms " +
+                    "upLoss=%.1f%%".format(session.inputLossEstimatePct()) + " " +
                     "queued=${session.queuedInputs()} applied=${session.commandsApplied} " +
                     "dropped=${session.commandsDropped} " +
                     "pendingEvents=${session.pendingEventCount}",
             )
         }
+
+        statsCsv?.println(
+            buildString {
+                append(System.currentTimeMillis()).append(',')
+                append(tps).append(',')
+                append(tickPercentileUs(0.50)).append(',')
+                append(tickPercentileUs(0.95)).append(',')
+                append(tickPercentileUs(0.99)).append(',')
+                append(sessions.size).append(',')
+                append(world.bots.size).append(',')
+                append(socket.packetsReceived.get()).append(',')
+                append(socket.packetsSent.get()).append(',')
+                append(rejectedPackets).append(',')
+                append(sessionManager.rejectedConnects).append(',')
+                append(snapshotBuilder.peakSize)
+            },
+        )
     }
 
     // ------------------------------------------------------------- shutdown
@@ -677,8 +740,13 @@ class GameServer(private val config: ServerConfig) {
             socket.send(writer.buffer, len, session.address, session.port)
             Log.info("  disconnected ${session.nickname} (#${session.id})")
         }
-        sessions.clear()
+        sessionManager.clearAll()
         socket.close()
+        try {
+            statsCsv?.close()
+        } catch (_: Exception) {
+        }
+        statsCsv = null
         Log.info(
             "final stats: ticks=$tickCount rx=${socket.packetsReceived.get()} " +
                 "tx=${socket.packetsSent.get()} rejected=$rejectedPackets " +
@@ -730,5 +798,6 @@ class GameServer(private val config: ServerConfig) {
         private const val MAX_FRAME_NANOS = 250_000_000L
         private const val LOBBY_INTERVAL_NANOS = 500_000_000L
         private const val STATS_INTERVAL_NANOS = 10_000_000_000L
+        private const val TICK_METRIC_CAP = 600
     }
 }

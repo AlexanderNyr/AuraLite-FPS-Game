@@ -19,12 +19,14 @@ import com.lanfps.shared.SnapshotDelta
 import com.lanfps.shared.SnapshotKind
 import com.lanfps.shared.Team
 import com.lanfps.shared.Vec3
+import com.lanfps.shared.Weapons
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The whole client side of the protocol: one UDP socket, one send/simulate
@@ -45,7 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class NetworkClient(
     private val state: ClientGameState,
     private val input: InputController,
-    private val arena: ArenaDef,
+    @Volatile private var arena: ArenaDef,
     private val listener: Listener,
 ) {
 
@@ -91,6 +93,29 @@ class NetworkClient(
     /** P1-2: last full snapshot (our delta base) and scratch for reconstruction. */
     private val baseFull = ArrayList<EntityState>()
     private val reconstructed = ArrayList<EntityState>()
+
+    /** P3-4: a queued MODE_VOTE (-1 = none); sent by the tx thread. */
+    private val pendingModeVote = AtomicInteger(-1)
+
+    // Scratch for the per-pellet tracer scatter (tx thread only).
+    private val tracerRng = java.util.Random()
+    private val basisR = Vec3()
+    private val basisU = Vec3()
+    private val pelletDir = Vec3()
+
+    /** P2-3: the activity swaps the arena when the server rotates maps. */
+    fun updateArena(newArena: ArenaDef) {
+        arena = newArena
+    }
+
+    /**
+     * P3-4: queues a lobby vote for the ruleset of the next match. Called from
+     * the UI thread; the actual datagram goes out on the tx thread, so it is
+     * safe to poke at any time while connected (and harmless when not).
+     */
+    fun voteMode(mode: GameMode) {
+        pendingModeVote.set(mode.wire)
+    }
 
     // ------------------------------------------------------------------ API
 
@@ -220,6 +245,7 @@ class NetworkClient(
         val req = Packets.ConnectRequest()
         req.nickname = nickname
         req.preferredMode = GameMode.DM.wire
+        req.password = state.password
 
         var attempt = 0
         while (attempt < CONNECT_ATTEMPTS && running.get() && !wantDisconnect.get()) {
@@ -288,6 +314,13 @@ class NetworkClient(
                 "ARENA MISMATCH: server=0x%08X client=0x%08X - geometry may differ"
                     .format(acc.arenaHash, localHash),
             )
+            // P2-3: if the mismatch is just the server sitting on a rotated map
+            // (we joined mid-rotation), hot-load that map instead of playing on
+            // with hash-mismatched geometry.
+            if (acc.arena.isNotEmpty() && acc.arena != state.arena.name) {
+                state.pendingArenaName = acc.arena
+                state.pendingArenaHash = acc.arenaHash
+            }
         }
 
         state.prediction?.reset()
@@ -380,7 +413,9 @@ class NetworkClient(
 
             // ---- predicted muzzle flash / tracer -----------------------------
             if (playing && state.alive && cmd.firePressed && now >= nextFireAt) {
-                nextFireAt = now + (GameConstants.WEAPON_FIRE_INTERVAL * 1000f).toLong()
+                // The local fire click follows the same clock the server gives
+                // the CURRENT weapon: shotgun thumps, sniper waits.
+                nextFireAt = now + (Weapons.byId(state.localWeapon).fireInterval * 1000f).toLong()
                 spawnLocalTracer(pred, eye, dir, now)
             }
             if (!cmd.firePressed && nextFireAt > now + 200) nextFireAt = now
@@ -388,6 +423,21 @@ class NetworkClient(
             // ---- send ---------------------------------------------------------
             recentCommands.add(cmd.copy())
             while (recentCommands.size > GameConstants.INPUT_REDUNDANCY) recentCommands.removeAt(0)
+
+            // P3-4: flush a queued lobby vote (one datagram; the server
+            // timestamp-orders it with everything else from this endpoint).
+            val vote = pendingModeVote.getAndSet(-1)
+            if (vote >= 0) {
+                try {
+                    Protocol.begin(writer, PacketTypes.MODE_VOTE)
+                    Packets.writeModeVote(writer, vote)
+                    val vlen = Protocol.end(writer)
+                    sock.send(DatagramPacket(writer.buffer, vlen, addr, port))
+                    state.packetsOut++
+                } catch (e: Exception) {
+                    AndroidLog.d("mode vote send failed: ${e.message}")
+                }
+            }
 
             try {
                 // P1-4: the header ack tells the server the newest MATCH_EVENT we
@@ -501,6 +551,7 @@ class NetworkClient(
             preferredMode = GameMode.DM.wire
             clientTimeMs = System.currentTimeMillis()
             resumeToken = state.resumeToken
+            password = state.password
         }
         try {
             Protocol.begin(writer, PacketTypes.CONNECT_REQUEST)
@@ -527,48 +578,87 @@ class NetworkClient(
     }
 
     /**
-     * Draws the bullet the player just fired.
+     * Draws the burst the player just fired.
      *
-     * This is cosmetic only. The ray is traced against level geometry and the
+     * This is cosmetic only. The rays are traced against level geometry and the
      * *interpolated* positions of other entities purely to decide where the
-     * tracer should stop; whether anybody was actually hit is decided by the
+     * tracers should stop; whether anybody was actually hit is decided by the
      * server, on its own timeline, and reaches us as a health change.
+     *
+     * P2-1: the visual now honours the weapon being held — the shotgun throws a
+     * visible fan of pellets, the sniper kicks like a mule.
      */
     private fun spawnLocalTracer(pred: Prediction?, eye: Vec3, dir: Vec3, now: Long) {
         if (pred == null) return
         pred.eyePosition(eye)
         MathUtil.forwardFromAngles(pred.body.yaw, pred.body.pitch, dir)
 
-        var dist = RayMath.raycastArena(eye, dir, GameConstants.WEAPON_RANGE, arena)
-
-        val snap = state.snapshots.latest
-        if (snap != null) {
-            val box = com.lanfps.shared.Aabb()
-            for (e in snap.entities) {
-                if (e.id == state.localPlayerId || !e.alive) continue
-                val h = if (e.crouching) {
-                    GameConstants.PLAYER_CROUCH_HEIGHT
-                } else {
-                    GameConstants.PLAYER_HEIGHT
-                }
-                box.set(
-                    e.x - GameConstants.PLAYER_RADIUS, e.y, e.z - GameConstants.PLAYER_RADIUS,
-                    e.x + GameConstants.PLAYER_RADIUS, e.y + h, e.z + GameConstants.PLAYER_RADIUS,
-                )
-                val t = RayMath.rayAabb(eye, dir, box, dist)
-                if (t != RayMath.NO_HIT && t < dist) dist = t
-            }
+        val weapon = Weapons.byId(state.localWeapon)
+        alignSpreadBasis(dir)
+        val tanSpread = if (weapon.spreadDeg > 0f) {
+            kotlin.math.tan(weapon.spreadDeg * MathUtil.DEG_TO_RAD)
+        } else {
+            0f
         }
 
-        state.addTracer(
-            eye.x, eye.y - 0.08f, eye.z,
-            eye.x + dir.x * dist, eye.y + dir.y * dist, eye.z + dir.z * dist,
-            local = true,
-        )
+        val snap = state.snapshots.latest
+        val box = com.lanfps.shared.Aabb()
+
+        for (p in 0 until weapon.pellets) {
+            pelletDir.set(dir)
+            if (tanSpread > 0f) {
+                pelletDir.addScaled(basisR, (tracerRng.nextFloat() * 2f - 1f) * tanSpread)
+                pelletDir.addScaled(basisU, (tracerRng.nextFloat() * 2f - 1f) * tanSpread)
+                pelletDir.normalize()
+            }
+
+            var dist = RayMath.raycastArena(eye, pelletDir, weapon.range, arena)
+            if (snap != null) {
+                for (e in snap.entities) {
+                    if (e.id == state.localPlayerId || !e.alive) continue
+                    val h = if (e.crouching) {
+                        GameConstants.PLAYER_CROUCH_HEIGHT
+                    } else {
+                        GameConstants.PLAYER_HEIGHT
+                    }
+                    box.set(
+                        e.x - GameConstants.PLAYER_RADIUS, e.y, e.z - GameConstants.PLAYER_RADIUS,
+                        e.x + GameConstants.PLAYER_RADIUS, e.y + h, e.z + GameConstants.PLAYER_RADIUS,
+                    )
+                    val t = RayMath.rayAabb(eye, pelletDir, box, dist)
+                    if (t != RayMath.NO_HIT && t < dist) dist = t
+                }
+            }
+
+            state.addTracer(
+                eye.x, eye.y - 0.08f, eye.z,
+                eye.x + pelletDir.x * dist, eye.y + pelletDir.y * dist, eye.z + pelletDir.z * dist,
+                local = true,
+            )
+        }
+
         state.lastLocalFireMs = now
         state.muzzleFlashUntilMs = now + 45
-        state.recoilPitch = MathUtil.clamp(state.recoilPitch + 0.55f, 0f, 3.0f)
+        state.recoilPitch = MathUtil.clamp(
+            state.recoilPitch + weapon.recoilPitchDeg, 0f, 3.4f,
+        )
         SoundManager.gunshot() // P1-3: local muzzle report
+    }
+
+    /**
+     * Builds the orthonormal basis (dir, basisR, basisU) the pellet scatter is
+     * sprayed in — identical maths to the server's burst cast, so what you see
+     * is honestly what the server rolls.
+     */
+    private fun alignSpreadBasis(dir: Vec3) {
+        basisR.set(-dir.z, 0f, dir.x)
+        if (basisR.lengthSquared() < 1e-6f) basisR.set(1f, 0f, 0f)
+        basisR.normalize()
+        basisU.set(
+            basisR.z * dir.y - basisR.y * dir.z,
+            basisR.x * dir.z - basisR.z * dir.x,
+            basisR.y * dir.x - basisR.x * dir.y,
+        )
     }
 
     // ---- inbox draining ----------------------------------------------------
@@ -667,9 +757,14 @@ class NetworkClient(
         state.kills = me.kills
         state.deaths = me.deaths
         state.localTeam = me.teamEnum
+        // P2-1/P2-2: the server is the boss of what we are holding and how many
+        // rounds are left in it; the HUD and viewmodel just mirror it.
+        state.localWeapon = me.weapon
+        state.localAmmo = me.ammo
 
         if (me.health < oldHealth && me.alive) {
             state.damageFlashUntilMs = now + 260
+            state.lastDamageTakenMs = now // MainActivity vibrates on this edge
             SoundManager.damage() // P1-3: taking damage
         }
 
@@ -696,6 +791,7 @@ class NetworkClient(
             pred.teleportTo(me)
             input.setAngles(me.yaw, 0f)
             state.respawnInSec = 0f
+            state.spectateId = -1 // P2-5: back in our own body
             SoundManager.respawn() // P1-3: respawn cue
             AndroidLog.d("local player respawned at (%.1f, %.1f, %.1f)".format(me.x, me.y, me.z))
             return
@@ -705,21 +801,51 @@ class NetworkClient(
     }
 
     private fun spawnRemoteTracer(e: EntityState) {
+        val weapon = Weapons.byId(e.weapon)
         val dir = Vec3()
         MathUtil.forwardFromAngles(e.yaw, e.pitch, dir)
         val eye = Vec3(e.x, e.y + GameConstants.EYE_HEIGHT, e.z)
-        val dist = RayMath.raycastArena(eye, dir, GameConstants.WEAPON_RANGE, arena)
-        state.addTracer(
-            eye.x, eye.y - 0.05f, eye.z,
-            eye.x + dir.x * dist, eye.y + dir.y * dist, eye.z + dir.z * dist,
-            local = false,
-        )
+
+        alignSpreadBasis(dir)
+        val tanSpread = if (weapon.spreadDeg > 0f) {
+            kotlin.math.tan(weapon.spreadDeg * MathUtil.DEG_TO_RAD)
+        } else {
+            0f
+        }
+        // Full pellets would flood the tracer pool on a busy server; three rays
+        // already read clearly as a shotgun blast.
+        val rays = minOf(weapon.pellets, 3)
+
+        for (p in 0 until rays) {
+            pelletDir.set(dir)
+            if (tanSpread > 0f) {
+                pelletDir.addScaled(basisR, (tracerRng.nextFloat() * 2f - 1f) * tanSpread)
+                pelletDir.addScaled(basisU, (tracerRng.nextFloat() * 2f - 1f) * tanSpread)
+                pelletDir.normalize()
+            }
+            val dist = RayMath.raycastArena(eye, pelletDir, weapon.range, arena)
+            state.addTracer(
+                eye.x, eye.y - 0.05f, eye.z,
+                eye.x + pelletDir.x * dist, eye.y + pelletDir.y * dist, eye.z + pelletDir.z * dist,
+                local = false,
+            )
+        }
     }
 
     private fun winningTeam(snap: Snapshot): Int = when {
         snap.redScore > snap.blueScore -> Team.RED.wire
         snap.blueScore > snap.redScore -> Team.BLUE.wire
         else -> Team.NONE.wire
+    }
+
+    /** Decodes the "0x%08X" arena-hash field a MATCH_START event carries (P2-3). */
+    private fun parseArenaHashField(text: String): Int {
+        if (!text.startsWith("0x")) return 0
+        return try {
+            text.substring(2).toLong(16).toInt()
+        } catch (_: Exception) {
+            0
+        }
     }
 
     private fun drainEvents() {
@@ -735,13 +861,32 @@ class NetworkClient(
             }
             state.highestEventSeq = ev.eventSeq
             when (ev.eventType) {
-                MatchEventType.KILL ->
+                MatchEventType.KILL -> {
                     state.addKill(ev.killerName, ev.victimName, ev.killerId, ev.victimId)
+                    // P2-5: while we wait out the respawn, watch the fight from
+                    // the killer's eyes instead of staring at the floor.
+                    if (ev.victimId == state.localPlayerId && ev.killerId != state.localPlayerId) {
+                        state.spectateId = ev.killerId
+                    }
+                }
 
                 MatchEventType.MATCH_START -> {
                     AndroidLog.i("match started")
                     state.clearKillFeed()
+                    // NB: spectateId is deliberately NOT cleared here. A new
+                    // match respawns everyone, and the alive-transition in
+                    // applySnapshot is the authoritative P2-5 reset; clearing
+                    // here would only add a second, racy owner of the same flag.
                     if (state.phase == Phase.ENDED) state.phase = Phase.PLAYING
+                    // P2-3: MATCH_START carries the arena identity (name in
+                    // killerName, "0x...." hash in victimName). When the match
+                    // rotated to a different map, ask the activity to hot-load
+                    // it before the mismatch hurts anyone.
+                    if (ev.killerName.isNotEmpty() && ev.killerName != state.arena.name) {
+                        state.pendingArenaName = ev.killerName
+                        state.pendingArenaHash = parseArenaHashField(ev.victimName)
+                        AndroidLog.i("match rotated to ${ev.killerName} - hot-loading the map")
+                    }
                     listener.onMatchStateChanged(MatchState.ACTIVE, 0)
                 }
 
@@ -850,6 +995,10 @@ class NetworkClient(
                         val lobby = Packets.readLobbyState(reader)
                         state.serverName = lobby.serverName
                         state.mode = GameMode.fromWire(lobby.mode)
+                        // P2-6 / P3-4: the rules of the match and the vote tally.
+                        state.killLimit = lobby.killLimit
+                        state.votesDm = lobby.votesDm
+                        state.votesTdm = lobby.votesTdm
                         // P0-1: LOBBY_STATE is now the ONLY place names arrive.
                         for (p in lobby.players) state.setRosterName(p.id, p.name)
                     }

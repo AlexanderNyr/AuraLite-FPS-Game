@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Russian resources (P3-4 of docs/IMPROVEMENT_PLAN.md).
+
+  Only the launcher label lives in resources: the in-game UI is built in code
+  (UiKit + the View screens) and is still English-only there. Moving those
+  strings into resources is tracked as follow-up work; this file makes the
+  language fallback table correct and localises what the system shows.
+-->
+<resources>
+    <string name="app_name">LAN FPS</string>
+</resources>

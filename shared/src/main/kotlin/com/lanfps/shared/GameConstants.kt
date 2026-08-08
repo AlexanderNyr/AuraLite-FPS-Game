@@ -11,9 +11,10 @@ object GameConstants {
     /** ASCII "LANF" — first 4 bytes of every packet. */
     const val MAGIC: Int = 0x4C414E46
 
-    /** Bumped to 2 when nicknames were removed from snapshots and the
-     *  CONNECT_REQUEST / CONNECT_ACCEPTED layouts gained a resume token. */
-    const val PROTOCOL_VERSION: Int = 2
+    /** Bumped to 3 (P2/P3 of the improvement plan): EntityState gained weapon +
+     *  ammo bytes, CONNECT_REQUEST gained a password field, LOBBY_STATE gained
+     *  killLimit + mode votes, and the MODE_VOTE packet type was added. */
+    const val PROTOCOL_VERSION: Int = 3
 
     const val DEFAULT_UDP_PORT: Int = 7777
     const val DEFAULT_TCP_PORT: Int = 7778
@@ -104,12 +105,10 @@ object GameConstants {
     const val MAX_PITCH_DEG: Float = 89.0f
 
     // ---- Weapon ------------------------------------------------------------
-    const val WEAPON_DAMAGE: Int = 25
-    const val WEAPON_RANGE: Float = 120.0f
-    /** Seconds between shots (≈ 480 RPM). */
-    const val WEAPON_FIRE_INTERVAL: Float = 0.125f
-    /** First version: infinite ammo, HUD shows the infinity glyph. */
-    const val WEAPON_INFINITE_AMMO: Boolean = true
+    // Weapon numbers (damage, rate of fire, magazine, spread, range, recoil)
+    // live in [Weapons] / [WeaponDef] — P2-1 replaced the single hard-coded
+    // rifle with a catalogue. Finite vs infinite ammo is a server config key
+    // (`infiniteAmmo` in server.properties), not a constant.
 
     // ---- Match -------------------------------------------------------------
     const val RESPAWN_DELAY_SEC: Float = 3.0f

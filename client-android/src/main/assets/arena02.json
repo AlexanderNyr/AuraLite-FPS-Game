@@ -1,0 +1,46 @@
+{
+  "name": "arena02",
+  "bounds": { "minX": -22, "maxX": 22, "minZ": -22, "maxZ": 22, "wallHeight": 4 },
+  "brushes": [
+    { "min": [-22, -0.5, -22], "max": [22, 0, 22], "material": "floor", "solid": false },
+    { "min": [-23, 0, -23], "max": [23, 4, -22], "material": "wall" },
+    { "min": [-23, 0, 22], "max": [23, 4, 23], "material": "wall" },
+    { "min": [-23, 0, -23], "max": [-22, 4, 23], "material": "wall" },
+    { "min": [22, 0, -23], "max": [23, 4, 23], "material": "wall" },
+    { "min": [-1, 0, -22], "max": [1, 3, -8], "material": "wall" },
+    { "min": [-1, 0, 8], "max": [1, 3, 22], "material": "wall" },
+    { "min": [-22, 0, -1], "max": [-8, 3, 1], "material": "wall" },
+    { "min": [8, 0, -1], "max": [22, 3, 1], "material": "wall" },
+    { "min": [10, 0, 10], "max": [12, 1, 12], "material": "crate" },
+    { "min": [-12, 0, 10], "max": [-10, 1, 12], "material": "crate" },
+    { "min": [10, 0, -12], "max": [12, 1, -10], "material": "crate" },
+    { "min": [-12, 0, -12], "max": [-10, 1, -10], "material": "crate" },
+    { "min": [11, 0, 2], "max": [13, 1.5, 4], "material": "cover" },
+    { "min": [-13, 0, 2], "max": [-11, 1.5, 4], "material": "cover" },
+    { "min": [11, 0, -4], "max": [13, 1.5, -2], "material": "cover" },
+    { "min": [-13, 0, -4], "max": [-11, 1.5, -2], "material": "cover" },
+    { "min": [-17, 0, -1], "max": [-15, 2, 1], "material": "cover" },
+    { "min": [15, 0, -1], "max": [17, 2, 1], "material": "cover" }
+  ],
+  "spawns": [
+    { "pos": [-20, 0, -15], "yaw": 90, "team": "RED" },
+    { "pos": [-20, 0, -5], "yaw": 90, "team": "RED" },
+    { "pos": [-20, 0, 5], "yaw": 90, "team": "RED" },
+    { "pos": [-20, 0, 15], "yaw": 90, "team": "RED" },
+    { "pos": [20, 0, -15], "yaw": -90, "team": "BLUE" },
+    { "pos": [20, 0, -5], "yaw": -90, "team": "BLUE" },
+    { "pos": [20, 0, 5], "yaw": -90, "team": "BLUE" },
+    { "pos": [20, 0, 15], "yaw": -90, "team": "BLUE" }
+  ],
+  "waypoints": [
+    [0, 0, 0],
+    [4, 0, 0], [-4, 0, 0],
+    [0, 0, 4], [0, 0, -4],
+    [4, 0, 4], [-4, 0, 4],
+    [4, 0, -4], [-4, 0, -4],
+    [4, 0, 14], [-4, 0, 14],
+    [4, 0, -14], [-4, 0, -14],
+    [14, 0, 6], [-14, 0, 6],
+    [14, 0, -6], [-14, 0, -6]
+  ]
+}

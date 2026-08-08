@@ -61,6 +61,38 @@ class ClientSession(
     /** Server-measured round-trip time, EMA-smoothed. */
     @JvmField var smoothedRttMs: Double = 0.0
 
+    // ---- P3-3: per-session observability ----------------------------------
+    /** Input sequence numbers that never arrived (gaps in the received stream).
+     *  A rough one-way loss estimate of the client's uplink. */
+    @JvmField var inputSeqGaps: Long = 0
+    /** Total new input sequences accepted (denominator for the loss estimate). */
+    @JvmField var inputSeqAccepted: Long = 0
+
+    /** Reservoir of recent RTT samples (ms) for percentile reporting. */
+    private val rttSamples = DoubleArray(RTT_SAMPLE_CAP)
+    private var rttSampleCount: Int = 0
+
+    /** Records one server-measured RTT sample. */
+    fun addRttSample(rttMs: Double) {
+        rttSamples[(rttSampleCount++) % RTT_SAMPLE_CAP] = rttMs
+    }
+
+    /** P95 RTT in ms over the recent reservoir (0 when no samples yet). */
+    fun rttP95(): Double {
+        val n = minOf(rttSampleCount, RTT_SAMPLE_CAP)
+        if (n == 0) return 0.0
+        val copy = DoubleArray(n) { rttSamples[it] }
+        copy.sort()
+        return copy[((n - 1) * 0.95).toInt()]
+    }
+
+    /** Estimated uplink packet loss in percent, 0..100. */
+    fun inputLossEstimatePct(): Double {
+        val total = inputSeqGaps + inputSeqAccepted
+        if (total == 0L) return 0.0
+        return inputSeqGaps.toDouble() * 100.0 / total.toDouble()
+    }
+
     // ---- P1-4: reliable match events -------------------------------------
     /** Unacknowledged MATCH_EVENTs waiting for this client to ack them. */
     private val pendingEvents = ArrayDeque<Packets.MatchEvent>()
@@ -99,6 +131,16 @@ class ClientSession(
             if (highestInputSeq >= 0 && !InputCommand.sequenceGreaterThan(cmd.sequence, highestInputSeq)) {
                 continue // duplicate or out-of-order straggler
             }
+            // P3-3: a jump in the sequence means the ones in between never made
+            // it (UDP loss upstream of us). Out-of-order stragglers within the
+            // redundancy window are already filtered by the check above.
+            if (highestInputSeq >= 0) {
+                val gap = (cmd.sequence - highestInputSeq - 1) and 0xFFFF
+                if (gap in 1..32) {
+                    inputSeqGaps += gap.toLong()
+                }
+            }
+            inputSeqAccepted++
             highestInputSeq = cmd.sequence
             if (queue.size >= MAX_QUEUED_INPUTS) {
                 // Client is far ahead (lag spike recovery); drop the oldest so we
@@ -189,6 +231,7 @@ class ClientSession(
     companion object {
         const val MAX_QUEUED_INPUTS = 12
         const val STARVE_EXTRAPOLATE_TICKS = 6
+        private const val RTT_SAMPLE_CAP = 48
 
         fun endpointKey(address: InetAddress, port: Int): String =
             address.hostAddress + ":" + port

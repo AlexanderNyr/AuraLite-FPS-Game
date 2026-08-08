@@ -11,6 +11,7 @@ import com.lanfps.shared.GameMode
 import com.lanfps.shared.Material
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.Team
+import com.lanfps.shared.Weapons
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.abs
@@ -31,8 +32,21 @@ import kotlin.math.sin
  */
 class GameRenderer(
     private val state: ClientGameState,
-    private val arena: ArenaDef,
+    @Volatile private var arena: ArenaDef,
 ) : GLSurfaceView.Renderer {
+
+    /**
+     * P2-3: a map queued by [setArena], applied on the GL thread at the start of
+     * the next frame (rebuilding the mesh must happen where the GL context
+     * lives). Never touched by the network or UI threads beyond the volatile
+     * hand-off.
+     */
+    @Volatile private var pendingArena: ArenaDef? = null
+
+    /** P2-3: asks the renderer to switch to a rotated map. Any thread may call. */
+    fun setArena(newArena: ArenaDef) {
+        pendingArena = newArena
+    }
 
     // ---- GL objects --------------------------------------------------------
     private var litShader: ShaderProgram? = null
@@ -105,6 +119,18 @@ class GameRenderer(
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        // P2-3: consume a pending map rotation before anything is drawn. Doing
+        // it here (rather than in setArena) means the VBO is rebuilt on the
+        // thread that owns the GL context.
+        pendingArena?.let {
+            pendingArena = null
+            if (it != arena) {
+                arena = it
+                buildArenaMesh()
+                AndroidLog.i("arena mesh rebuilt for ${it.name} (map rotation)")
+            }
+        }
+
         val now = System.nanoTime()
         var dt = (now - lastFrameNanos) / 1_000_000_000f
         lastFrameNanos = now
@@ -127,7 +153,12 @@ class GameRenderer(
         val flat = flatShader ?: return
 
         val playing = state.phase == Phase.PLAYING || state.phase == Phase.ENDED
+        val nowMs = System.currentTimeMillis()
+        state.snapshots.sampleInto(renderEntities, entityPool, nowMs)
+
         if (playing) updateGameCamera(dt) else updateMenuCamera(dt)
+        // P2-5: while dead, the camera borrows the killer's eyes.
+        if (playing && !state.alive) applySpectatorCamera()
         state.publishViewProj(camera.viewProjection)
 
         // ---- world ---------------------------------------------------------
@@ -144,13 +175,16 @@ class GameRenderer(
         arenaMesh.draw()
 
         // ---- players --------------------------------------------------------
-        val nowMs = System.currentTimeMillis()
-        state.snapshots.sampleInto(renderEntities, entityPool, nowMs)
+        // P2-5: the body we are spectating must BE drawn - first-person for
+        // ourselves, third-person view of our killer, so skip whoever the
+        // camera is inside of.
         val localId = state.localPlayerId
+        val spectatingId = if (playing && !state.alive) state.spectateId else -1
         for (i in renderEntities.indices) {
             val e = renderEntities[i]
             if (!e.alive) continue
             if (e.id == localId && playing) continue // first person: no own body
+            if (e.id == spectatingId) continue // camera is inside this body
             drawPlayer(lit, e)
         }
 
@@ -202,6 +236,30 @@ class GameRenderer(
         }
 
         camera.setPose(state.eyeX, eyeY, state.eyeZ, state.viewYaw, state.viewPitch)
+    }
+
+    /**
+     * P2-5: spectate the killer while waiting out the respawn. The camera sits
+     * at the victim-view entity's eye and looks where it looks; when the target
+     * cannot be found (left the server, also died) we keep the body camera the
+     * network thread published.
+     */
+    private fun applySpectatorCamera() {
+        val id = state.spectateId
+        if (id < 0) return
+        for (i in renderEntities.indices) {
+            val e = renderEntities[i]
+            if (e.id != id) continue
+            if (!e.alive) return
+            // No bob, no recoil - a calm chase-cam read of someone else's fight.
+            val eyeH = if (e.crouching) {
+                GameConstants.EYE_HEIGHT_CROUCH
+            } else {
+                GameConstants.EYE_HEIGHT
+            }
+            camera.setPose(e.x, e.y + eyeH, e.z, e.yaw, e.pitch)
+            return
+        }
     }
 
     /** Slow orbit over the arena, shown behind the menus. */
@@ -278,14 +336,35 @@ class GameRenderer(
         val offZ = -kick * 0.035f
         val offY = kick * 0.010f
 
+        // P2-1: silhouette and tint change with the weapon the server says we
+        // hold, so the viewmodel confirms what the HUD claims. The shotgun is
+        // stubby and warm, the sniper long and cold.
+        var tintR = 1f
+        var tintG = 1f
+        var tintB = 1f
+        var scaleX = 1f
+        var scaleY = 1f
+        var scaleZ = 1f
+        when (state.localWeapon) {
+            Weapons.SHOTGUN -> {
+                tintR = 1.08f; tintG = 0.95f; tintB = 0.78f
+                scaleX = 1.22f; scaleY = 1.10f; scaleZ = 0.80f
+            }
+            Weapons.SNIPER -> {
+                tintR = 0.82f; tintG = 0.95f; tintB = 1.12f
+                scaleX = 0.90f; scaleY = 0.90f; scaleZ = 1.32f
+            }
+        }
+
         camera.viewModelMatrix(model, 0.155f + bobX, -0.135f + bobY + offY, offZ)
         // Pitch the muzzle up slightly with recoil.
         Matrix.setIdentityM(scratch, 0)
         Matrix.rotateM(scratch, 0, kick * 2.2f, 1f, 0f, 0f)
+        Matrix.scaleM(scratch, 0, scaleX, scaleY, scaleZ)
         Matrix.multiplyMM(scratch, 0, model, 0, scratch, 0)
 
         lit.setMatrix("uModel", scratch)
-        lit.setVec3("uTint", 1f, 1f, 1f)
+        lit.setVec3("uTint", tintR, tintG, tintB)
         lit.setFloat("uFogDensity", 0f)
         weaponMesh.draw()
         lit.setFloat("uFogDensity", 0.0075f)

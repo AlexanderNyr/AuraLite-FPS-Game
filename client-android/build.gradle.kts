@@ -40,10 +40,15 @@ android {
             isDebuggable = true
         }
         release {
-            // R8 is off on purpose: the whole app is ~40 classes, shrinking buys
-            // nothing and only adds a way for the build to fail.
-            isMinifyEnabled = false
-            isShrinkResources = false
+            // P3-4: R8 is ON for releases now (the app still uses zero
+            // reflection, so the default rules plus proguard-rules.pro are
+            // enough and shrinking removes roughly a third of the DEX).
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             if (rootProject.file("keystore/lanfps.keystore").exists()) {
                 signingConfig = signingConfigs.getByName("local")
             }
