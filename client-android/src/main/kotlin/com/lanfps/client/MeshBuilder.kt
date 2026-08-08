@@ -111,6 +111,7 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         shadeBottom: Boolean = false,
         uvMode: UvMode = UvMode.FIT,
         uvScale: Float = 4f,
+        glowBottom: Float = 0f,
     ) {
         val lo = if (shadeBottom) 0.72f else 1f
         val hi = 1f
@@ -121,6 +122,20 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
             if (h <= 0.0001f) return hi
             val t = ((y - y0) / h).coerceIn(0f, 1f)
             return lo + (hi - lo) * t
+        }
+
+        /**
+         * Baked ambient bounce from the arena floor: vertical faces lift
+         * toward the bottom edge with a cool cyan tint, as if the glowing
+         * floor strips leaked onto the lower half of every wall and pillar.
+         * Zero at the top, full at y0; pure addition, palette-neutral.
+         */
+        fun bounce(y: Float): Float {
+            if (glowBottom <= 0f) return 0f
+            val h = (y1 - y0)
+            if (h <= 0.0001f) return 0f
+            val t = ((y - y0) / h).coerceIn(0f, 1f)
+            return (1f - t) * glowBottom
         }
 
         // Maps a position on a face to (u,v). The face's normal decides which
@@ -158,8 +173,13 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         // Vertical faces get the gradient; horizontal faces use a flat tint.
         fun v(x: Float, y: Float, z: Float, nx: Float, ny: Float, nz: Float) {
             val s = shade(y)
+            val glow = bounce(y)
             val (uu, vv) = uv(nx, ny, nz, x, y, z)
-            vertex(x, y, z, nx, ny, nz, r * s, g * s, b * s, uu, vv)
+            vertex(
+                x, y, z, nx, ny, nz,
+                r * s + 0.045f * glow, g * s + 0.085f * glow, b * s + 0.150f * glow,
+                uu, vv,
+            )
         }
 
         fun face(
@@ -194,9 +214,10 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         shadeBottom: Boolean = false,
         uvMode: UvMode = UvMode.FIT,
         uvScale: Float = 4f,
+        glowBottom: Float = 0f,
     ) = box(
         aabb.minX, aabb.minY, aabb.minZ, aabb.maxX, aabb.maxY, aabb.maxZ,
-        r, g, b, shadeBottom, uvMode, uvScale,
+        r, g, b, shadeBottom, uvMode, uvScale, glowBottom,
     )
 
     /**

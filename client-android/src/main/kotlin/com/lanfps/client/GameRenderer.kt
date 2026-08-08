@@ -39,6 +39,15 @@ import kotlin.math.sin
  * cloud layer. Shadows come in two cheap layers: a baked contact darkening of
  * floor tiles near static geometry, and per-frame blob quads under every live
  * player that fade with drop height.
+ *
+ * On top of that sits the post chain ([PostFx]): the whole scene renders into
+ * an MSAA off-screen buffer, bright pixels are blurred into a bloom halo and
+ * the final fullscreen pass applies exposure tonemapping, split-tone grading
+ * and a vignette. Any device unable to host that framebuffer matrix falls
+ * back to the exact pre-post direct path. A CPU [ParticleSystem] adds sparks,
+ * death shards, foot dust and ambient motes inside the additive effects
+ * batch; remote players got articulated legs with a swing that follows
+ * smoothed snapshot speed, plus a small forward lean while running.
  */
 class GameRenderer(
     private val state: ClientGameState,
@@ -65,10 +74,19 @@ class GameRenderer(
     private var skyShader: ShaderProgram? = null
     private var shadowShader: ShaderProgram? = null
 
+    /** Bloom / tonemap / grading pipeline; disables itself on weak drivers. */
+    private val postFx = PostFx()
+    private var surfW = 0
+    private var surfH = 0
+
     /** One mesh per material id, so each can bind its own texture. */
     private val materialMeshes = HashMap<Int, Mesh>(6)
     private val spawnMesh = Mesh(hasNormals = true)
-    private val playerMesh = Mesh(hasNormals = true)
+    // The avatar split so legs can swing while the upper body leans: body mesh
+    // holds torso/shoulders/head/rifle; leg mesh is ONE leg with its origin at
+    // the hip so a single rotateM in world space swings it like a pendulum.
+    private val playerBodyMesh = Mesh(hasNormals = true)
+    private val playerLegMesh = Mesh(hasNormals = true)
     private val weaponMesh = Mesh(hasNormals = true)
     // The sky needs UVs but not normals; the lit layout is the only one with
     // UVs, so it piggy-backs on it (a handful of unused floats per vertex).
@@ -87,8 +105,35 @@ class GameRenderer(
     private var skyTex = 0
     private var whiteTex = 0
 
+    // ---- particles ----------------------------------------------------------
+    // One additive batch for sparks, death shards, foot dust and ambient motes.
+    private val particleMesh = DynamicMesh(hasNormals = false, maxVertices = 6 * ParticleSystem.MAX)
+    private val particles = ParticleSystem(particleMesh)
+
+    /** Edge-detect for the local muzzle flash (weapon audio does the same). */
+    private var prevMuzzleActive = false
+
+    /** Last-frame alive flags per entity id, for death-burst detection. */
+    private val prevAlive = BooleanArray(64)
+
+    /** Emits foot dust at this interval while sprinting. */
+    private var footDustTimer = 0f
+
+    /** Smoothed per-player movement state for the lean / leg-swing animation. */
+    private class PlayerAnim {
+        var px = Float.NaN
+        var pz = Float.NaN
+        var speed = 0f
+        var phase = 0f
+        var lean = 0f
+    }
+
+    private val playerAnims = HashMap<Int, PlayerAnim>(16)
+
     private val camera = Camera()
     private val model = FloatArray(16)
+    /** Second scratch matrix for the per-leg transforms in drawPlayer. */
+    private val legModel = FloatArray(16)
     private val scratch = FloatArray(16)
     private val identity = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
@@ -129,7 +174,7 @@ class GameRenderer(
         loadTextures()
         buildSkyMesh()
         buildArenaMesh()
-        buildPlayerMesh()
+        buildPlayerMeshes()
         buildWeaponMesh()
 
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
@@ -145,7 +190,7 @@ class GameRenderer(
         GlUtil.checkError("onSurfaceCreated")
         AndroidLog.i(
             "renderer ready: arena=${materialMeshes.values.sumOf { it.vertexCount }} verts, " +
-                "player=${playerMesh.vertexCount} verts",
+                "player=${playerBodyMesh.vertexCount} verts",
         )
     }
 
@@ -264,6 +309,11 @@ class GameRenderer(
         camera.setPerspective(width, height)
         state.viewportWidth = width
         state.viewportHeight = height
+        surfW = width
+        surfH = height
+        // (Re)build the off-screen pipeline for the new size. On driver trouble
+        // the call quietly leaves postFx.ready = false and nothing changes.
+        if (surfaceReady) postFx.init(width, height)
         AndroidLog.i("surface ${width}x$height")
     }
 
@@ -295,6 +345,11 @@ class GameRenderer(
             frameCount = 0
             fpsAccum = 0f
         }
+
+        // Post pipeline: when up, everything below draws into the off-screen
+        // scene buffer and endSceneAndCompose puts it on the display. When the
+        // driver declined the FBO matrix, this branch disappears to nothing.
+        if (postFx.ready) postFx.beginScene()
 
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
 
@@ -335,6 +390,7 @@ class GameRenderer(
         lit.setFloat("uFogDensity", if (playing) 0.0075f else 0.0045f)
         lit.setVec3("uEye", camera.x, camera.y, camera.z)
         lit.setFloat("uAmbient", 0.55f)
+        lit.setFloat("uTime", timeSec)
         lit.setSampler("uTex", 0)
         lit.setMatrix("uModel", identity)
         lit.setVec3("uTint", 1f, 1f, 1f)
@@ -342,13 +398,20 @@ class GameRenderer(
         for ((material, mesh) in materialMeshes) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, materialTex[material] ?: whiteTex)
             lit.setFloat("uTexGain", texGain(material))
+            // The floor gets the slow scanning shimmer; walls keep still.
+            lit.setFloat("uSweep", if (material == Material.FLOOR) 1.0f else 0.0f)
+            lit.setFloat("uEmissive", 0.0f)
             mesh.draw()
         }
 
         // Spawn strips bind the white 1x1: detail layer = 1.0, pure palette.
+        // A gentle breathing glow on top — the marker that says "safe room".
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
+        lit.setFloat("uSweep", 0.0f)
+        lit.setFloat("uEmissive", 0.16f + 0.10f * sin(timeSec * 2.4f).coerceAtLeast(0f))
         spawnMesh.draw()
+        lit.setFloat("uEmissive", 0.0f)
 
         // ---- players --------------------------------------------------------
         // P2-5: the body we are spectating must BE drawn - first-person for
@@ -386,11 +449,26 @@ class GameRenderer(
             GLES30.glDisable(GLES30.GL_BLEND)
         }
 
-        // ---- tracers & flashes ----------------------------------------------
+        // ---- tracers, flashes & particles (one additive batch) ---------------
         state.collectTracers(nowMs, TRACER_TTL_MS, tracers)
         val muzzleActive = playing && nowMs < state.muzzleFlashUntilMs
-        if (tracers.isNotEmpty() || muzzleActive) {
-            buildEffects(nowMs, muzzleActive)
+        // Spawn muzzle sparks exactly once per shot: rising edge only.
+        if (muzzleActive && !prevMuzzleActive) {
+            val mx = camera.x + camera.rightX * 0.155f + camera.upX * -0.10f + camera.forwardX * 0.95f
+            val my = camera.y + camera.rightY * 0.155f + camera.upY * -0.10f + camera.forwardY * 0.95f
+            val mz = camera.z + camera.rightZ * 0.155f + camera.upZ * -0.10f + camera.forwardZ * 0.95f
+            particles.muzzleSparks(mx, my, mz, camera.forwardX, camera.forwardY, camera.forwardZ)
+        }
+        prevMuzzleActive = muzzleActive
+
+        updateParticles(dt, playing)
+        buildEffects(nowMs, muzzleActive)
+        particles.build(
+            camera.rightX, camera.rightY, camera.rightZ,
+            camera.upX, camera.upY, camera.upZ,
+            camera.x, camera.y, camera.z,
+        )
+        if (effectMesh.vertexCount > 0 || particleMesh.vertexCount > 0) {
             flat.use()
             flat.setMatrix("uViewProj", camera.viewProjection)
             GLES30.glEnable(GLES30.GL_BLEND)
@@ -398,6 +476,7 @@ class GameRenderer(
             GLES30.glDepthMask(false)
             GLES30.glDisable(GLES30.GL_CULL_FACE)
             effectMesh.draw()
+            particleMesh.draw()
             GLES30.glEnable(GLES30.GL_CULL_FACE)
             GLES30.glDepthMask(true)
             GLES30.glDisable(GLES30.GL_BLEND)
@@ -411,6 +490,80 @@ class GameRenderer(
             GLES30.glClear(GLES30.GL_DEPTH_BUFFER_BIT)
             drawWeapon(lit)
         }
+
+        // Post pipeline: resolve, bloom, grade, present — or a no-op fallback.
+        if (postFx.ready) postFx.endSceneAndCompose()
+    }
+
+    /**
+     * Physics + trigger feed for the particle pool for one rendered frame:
+     * advances the pool, keeps the dust volume glued to the camera, notices
+     * freshly-dead players (→ shard burst) and sprinkles foot dust under the
+     * local sprint. All effects key off [renderEntities] which sampleInto
+     * filled at the top of the frame.
+     */
+    private fun updateParticles(dt: Float, playing: Boolean) {
+        particles.update(dt, camera.x, camera.y, camera.z)
+
+        // Per-player movement records for leg swing / forward lean / foot dust.
+        // Speed is smoothed exponentially so snapshot hops cannot kick the pose.
+        if (playerAnims.size > 64) playerAnims.clear()
+        val idleDt = dt.coerceAtLeast(1e-4f)
+        for (i in renderEntities.indices) {
+            val e = renderEntities[i]
+            val a = playerAnims.getOrPut(e.id) { PlayerAnim() }
+            var raw = 0f
+            if (!a.px.isNaN() && idleDt > 0f) {
+                val dx = e.x - a.px
+                val dz = e.z - a.pz
+                // >2.5 m in one frame is a respawn teleport, not a run.
+                if (dx * dx + dz * dz < 2.5f * 2.5f) {
+                    raw = kotlin.math.sqrt(dx * dx + dz * dz) / idleDt
+                }
+            }
+            a.speed += (raw.coerceIn(0f, 8f) - a.speed) * (dt * 10f).coerceAtMost(1f)
+            a.phase += a.speed * dt * 2.4f
+            val target = (a.speed / 4.6f).coerceIn(0f, 1f)
+            a.lean += (target - a.lean) * (dt * 8f).coerceAtMost(1f)
+            a.px = e.x; a.pz = e.z
+
+            // Death detection piggybacks on the same pass over the entities.
+            val id = e.id
+            if (id in 0 until prevAlive.size) {
+                val was = prevAlive[id]
+                if (was && !e.alive && playing) {
+                    val (r, g, b) = playerPalette(e)
+                    particles.deathBurst(e.x, e.y, e.z, r, g, b)
+                }
+                prevAlive[id] = e.alive
+            }
+        }
+
+        // Foot dust under a fast-moving local player.
+        if (playing && state.alive) {
+            footDustTimer -= dt
+            val local = findLocalEntity()
+            if (local != null && footDustTimer <= 0f) {
+                val anim = playerAnims[local.id]
+                // Local anim records are kept for the shadow pass; speed > 2 m/s
+                // means an actual run, not a crouch-shuffle.
+                if (anim != null && anim.speed > 2.0f) {
+                    particles.footDust(local.x, local.y, local.z)
+                    footDustTimer = 0.085f
+                } else {
+                    footDustTimer = 0.02f
+                }
+            }
+        }
+    }
+
+    private fun findLocalEntity(): EntityState? {
+        val id = state.localPlayerId
+        for (i in renderEntities.indices) {
+            val e = renderEntities[i]
+            if (e.id == id) return e
+        }
+        return null
     }
 
     /**
@@ -566,29 +719,16 @@ class GameRenderer(
 
     // --------------------------------------------------------------- drawing
 
-    private fun drawPlayer(lit: ShaderProgram, e: EntityState) {
-        val crouchScale = if (e.crouching) {
-            GameConstants.PLAYER_CROUCH_HEIGHT / GameConstants.PLAYER_HEIGHT
-        } else {
-            1f
-        }
-
-        Matrix.setIdentityM(model, 0)
-        Matrix.translateM(model, 0, e.x, e.y, e.z)
-        // Model faces -Z at yaw 0, matching MathUtil.horizontalForward.
-        Matrix.rotateM(model, 0, -e.yaw, 0f, 1f, 0f)
-        if (crouchScale != 1f) Matrix.scaleM(model, 0, 1f, crouchScale, 1f)
-
-        lit.setMatrix("uModel", model)
-
-        var r: Float
-        var g: Float
-        var b: Float
+    /**
+     * Pre-health team palette for an entity — shared by the body renderer
+     * (which then darkens it by hp) and the death shard burst.
+     */
+    private fun playerPalette(e: EntityState): Triple<Float, Float, Float> {
         if (state.mode == GameMode.TDM) {
-            when (e.teamEnum) {
-                Team.RED -> { r = 0.88f; g = 0.32f; b = 0.26f }
-                Team.BLUE -> { r = 0.30f; g = 0.56f; b = 0.92f }
-                else -> { r = 0.80f; g = 0.80f; b = 0.80f }
+            var (r, g, b) = when (e.teamEnum) {
+                Team.RED -> Triple(0.88f, 0.32f, 0.26f)
+                Team.BLUE -> Triple(0.30f, 0.56f, 0.92f)
+                else -> Triple(0.80f, 0.80f, 0.80f)
             }
             // Teammates are tinted toward green so a glance is enough in a firefight.
             if (e.teamEnum == state.localTeam && e.id != state.localPlayerId) {
@@ -596,20 +736,91 @@ class GameRenderer(
                 g = g * 0.45f + 0.62f
                 b = b * 0.45f + 0.30f
             }
-        } else if (e.type == EntityType.BOT) {
-            r = 0.86f; g = 0.47f; b = 0.20f
-        } else {
-            r = 0.90f; g = 0.30f; b = 0.28f
+            return Triple(r, g, b)
         }
+        return if (e.type == EntityType.BOT) {
+            Triple(0.86f, 0.47f, 0.20f)
+        } else {
+            Triple(0.90f, 0.30f, 0.28f)
+        }
+    }
 
+    /**
+     * The avatar as two articulated parts: swinging legs (one mesh drawn twice
+     * around each hip) and a leaning upper body. Movement data comes from the
+     * [playerAnims] records that updateParticles maintains for every entity,
+     * so interpolation already smoothed this out of snapshot hops.
+     */
+    private fun drawPlayer(lit: ShaderProgram, e: EntityState) {
+        val crouchScale = if (e.crouching) {
+            GameConstants.PLAYER_CROUCH_HEIGHT / GameConstants.PLAYER_HEIGHT
+        } else {
+            1f
+        }
+        val anim = playerAnims[e.id]
+
+        Matrix.setIdentityM(model, 0)
+        Matrix.translateM(model, 0, e.x, e.y, e.z)
+        // Model faces -Z at yaw 0, matching MathUtil.horizontalForward.
+        Matrix.rotateM(model, 0, -e.yaw, 0f, 1f, 0f)
+        if (crouchScale != 1f) Matrix.scaleM(model, 0, 1f, crouchScale, 1f)
+
+        val (r0, g0, b0) = playerPalette(e)
         // Wounded enemies visibly darken: free feedback that your shots landed.
         val hp = MathUtil.clamp(e.health / GameConstants.MAX_HEALTH.toFloat(), 0f, 1f)
         val k = 0.55f + 0.45f * hp
-        lit.setVec3("uTint", r * k, g * k, b * k)
-        // Light armour plating, tinted by team colour; gain = 1/0.55 luma.
+
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, playerTex)
         lit.setFloat("uTexGain", 1.82f)
-        playerMesh.draw()
+
+        // ---- legs -------------------------------------------------------------
+        // Swing amplitude grows with speed up to a full run; phase advances with
+        // distance travelled so the cadence matches how fast the feet move.
+        if (anim != null && !e.crouching) {
+            val swingRad = kotlin.math.sin(anim.phase.toDouble()).toFloat() *
+                (anim.speed / 4.6f).coerceIn(0f, 1f) * 0.48f
+            lit.setVec3("uTint", r0 * k * 0.72f, g0 * k * 0.72f, b0 * k * 0.72f)
+            Matrix.setIdentityM(model, 0)
+            Matrix.translateM(model, 0, e.x, e.y, e.z)
+            Matrix.rotateM(model, 0, -e.yaw, 0f, 1f, 0f)
+            // left hip
+            System.arraycopy(model, 0, legModel, 0, 16)
+            Matrix.translateM(legModel, 0, -0.115f, 0.84f, 0f)
+            Matrix.rotateM(legModel, 0, swingRad * 57.29578f, 1f, 0f, 0f)
+            lit.setMatrix("uModel", legModel)
+            playerLegMesh.draw()
+            // right hip, antiphase: rebuild the base again
+            System.arraycopy(model, 0, legModel, 0, 16)
+            Matrix.translateM(legModel, 0, 0.115f, 0.84f, 0f)
+            Matrix.rotateM(legModel, 0, -swingRad * 57.29578f, 1f, 0f, 0f)
+            lit.setMatrix("uModel", legModel)
+            playerLegMesh.draw()
+        } else {
+            // Crouching / unknown motion: static legs under the torso.
+            lit.setVec3("uTint", r0 * k * 0.72f, g0 * k * 0.72f, b0 * k * 0.72f)
+            Matrix.setIdentityM(legModel, 0)
+            Matrix.translateM(legModel, 0, e.x, e.y, e.z)
+            Matrix.rotateM(legModel, 0, -e.yaw, 0f, 1f, 0f)
+            if (crouchScale != 1f) Matrix.scaleM(legModel, 0, 1f, crouchScale, 1f)
+            Matrix.translateM(legModel, 0, -0.115f, 0.84f, 0f)
+            lit.setMatrix("uModel", legModel)
+            playerLegMesh.draw()
+            Matrix.translateM(legModel, 0, 0.23f, 0f, 0f)
+            lit.setMatrix("uModel", legModel)
+            playerLegMesh.draw()
+        }
+
+        // ---- upper body --------------------------------------------------------
+        // Lean into the run direction: a couple of degrees of forward pitch.
+        Matrix.setIdentityM(model, 0)
+        Matrix.translateM(model, 0, e.x, e.y, e.z)
+        Matrix.rotateM(model, 0, -e.yaw, 0f, 1f, 0f)
+        if (crouchScale != 1f) Matrix.scaleM(model, 0, 1f, crouchScale, 1f)
+        if (anim != null) Matrix.rotateM(model, 0, -anim.lean * 7f, 1f, 0f, 0f)
+        lit.setMatrix("uModel", model)
+        lit.setVec3("uTint", r0 * k, g0 * k, b0 * k)
+        playerBodyMesh.draw()
+
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
     }
@@ -710,6 +921,9 @@ class GameRenderer(
             effectMesh.vertex(t.x0 - sx, t.y0 - sy, t.z0 - sz, r, g, b)
             effectMesh.vertex(t.x1 + sx, t.y1 + sy, t.z1 + sz, r, g, b)
             effectMesh.vertex(t.x0 + sx, t.y0 + sy, t.z0 + sz, r, g, b)
+
+            // Little sparks flicking off the bullet's nose while it flies.
+            particles.tracerSpark(t.x1, t.y1, t.z1, t.local)
         }
 
         if (muzzleActive) {
@@ -799,6 +1013,14 @@ class GameRenderer(
                 shadeBottom = brush.box.sizeY > 1.2f,
                 uvMode = style.mode,
                 uvScale = style.uvScale,
+                // Baked bounce of the floor neon onto vertical faces near the
+                // ground; tiny on ramps, strongest on walls and pillars.
+                glowBottom = when (brush.material) {
+                    Material.WALL -> 0.85f
+                    Material.PILLAR -> 0.70f
+                    Material.COVER, Material.CRATE -> 0.45f
+                    else -> 0.15f
+                },
             )
         }
 
@@ -849,24 +1071,28 @@ class GameRenderer(
      * model is facing and a stubby rifle. Vertex colours here are *multipliers*
      * on the per-entity team tint, so one mesh serves every player.
      */
-    private fun buildPlayerMesh() {
-        val b = MeshBuilder(withNormals = true, initialCapacity = 4096)
-
-        // legs
-        b.box(-0.17f, 0.00f, -0.14f, 0.17f, 0.84f, 0.14f, 0.68f, 0.68f, 0.72f)
+    private fun buildPlayerMeshes() {
+        // Upper body: torso, shoulders, head, visor, rifle.
+        val body = MeshBuilder(withNormals = true, initialCapacity = 4096)
         // torso
-        b.box(-0.25f, 0.84f, -0.17f, 0.25f, 1.44f, 0.17f, 1.00f, 1.00f, 1.00f)
+        body.box(-0.25f, 0.84f, -0.17f, 0.25f, 1.44f, 0.17f, 1.00f, 1.00f, 1.00f)
         // shoulders
-        b.box(-0.31f, 1.20f, -0.14f, 0.31f, 1.42f, 0.14f, 0.86f, 0.86f, 0.90f)
+        body.box(-0.31f, 1.20f, -0.14f, 0.31f, 1.42f, 0.14f, 0.86f, 0.86f, 0.90f)
         // head
-        b.box(-0.125f, 1.44f, -0.125f, 0.125f, 1.71f, 0.125f, 1.12f, 1.12f, 1.12f)
-        // visor (front is -Z)
-        b.box(-0.10f, 1.52f, -0.145f, 0.10f, 1.62f, -0.120f, 1.9f, 1.9f, 2.0f)
+        body.box(-0.125f, 1.44f, -0.125f, 0.125f, 1.71f, 0.125f, 1.12f, 1.12f, 1.12f)
+        // visor (front is -Z); extra bright so post bloom picks it up as a glow strip
+        body.box(-0.10f, 1.52f, -0.145f, 0.10f, 1.62f, -0.120f, 1.9f, 1.9f, 2.0f)
         // rifle held on the right side
-        b.box(0.17f, 1.06f, -0.62f, 0.29f, 1.19f, -0.10f, 0.22f, 0.22f, 0.24f)
-        b.box(0.19f, 1.19f, -0.34f, 0.27f, 1.26f, -0.14f, 0.18f, 0.18f, 0.20f)
+        body.box(0.17f, 1.06f, -0.62f, 0.29f, 1.19f, -0.10f, 0.22f, 0.22f, 0.24f)
+        body.box(0.19f, 1.19f, -0.34f, 0.27f, 1.26f, -0.14f, 0.18f, 0.18f, 0.20f)
+        playerBodyMesh.upload(body.raw(), body.floatCount)
 
-        playerMesh.upload(b.raw(), b.floatCount)
+        // ONE leg with the hip at the origin hanging down -Y: a rotation around
+        // the X axis in world space swings it like a pendulum. Drawn twice, one
+        // per hip offset, in opposite phase.
+        val leg = MeshBuilder(withNormals = true, initialCapacity = 1024)
+        leg.box(-0.075f, -0.84f, -0.115f, 0.015f, 0f, 0.035f, 0.68f, 0.68f, 0.72f)
+        playerLegMesh.upload(leg.raw(), leg.floatCount)
     }
 
     /** First-person weapon, modelled in view space (-Z points where you aim). */
@@ -911,11 +1137,14 @@ class GameRenderer(
         materialMeshes.clear()
         spawnMesh.dispose()
         skyMesh.dispose()
-        playerMesh.dispose()
+        playerBodyMesh.dispose()
+        playerLegMesh.dispose()
         weaponMesh.dispose()
         effectMesh.dispose()
+        particleMesh.dispose()
         shadowMesh.dispose()
         textureLoader.dispose()
+        postFx.dispose()
     }
 
     companion object {
@@ -968,6 +1197,12 @@ class GameRenderer(
             uniform vec3  uEye;
             uniform sampler2D uTex;
             uniform float uTexGain;
+            uniform float uTime;
+            // Sweep amplitude of the scanning shimmer running along the floor
+            // (1 on floor tiles, 0 on every other material's draw).
+            uniform float uSweep;
+            // Pure additive glow in vertex-colour space (spawn strip breathing).
+            uniform float uEmissive;
             in vec3 vNormal;
             in vec3 vColor;
             in vec3 vWorld;
@@ -986,6 +1221,16 @@ class GameRenderer(
                 // a silent no-op returning the pre-texture look.
                 vec3 detail = texture(uTex, vUv).rgb * uTexGain;
                 vec3 c = vColor * detail * uTint * light;
+                // A scanner shimmer sweeping diagonally across the arena floor:
+                // one cool band roughly 12 m wide, reappearing every ~8 s.
+                if (uSweep > 0.0) {
+                    float wave = sin(vWorld.x * 0.42 + vWorld.z * 0.31 - uTime * 1.35);
+                    float band = smoothstep(0.72, 0.96, wave) * uSweep;
+                    c += vec3(0.05, 0.10, 0.18) * band * (0.4 + 0.6 * detail.g);
+                }
+                if (uEmissive > 0.0) {
+                    c += vColor * uEmissive;
+                }
                 float dist = length(vWorld - uEye);
                 float fog = 1.0 - exp(-uFogDensity * dist);
                 c = mix(c, uFogColor, clamp(fog, 0.0, 1.0));

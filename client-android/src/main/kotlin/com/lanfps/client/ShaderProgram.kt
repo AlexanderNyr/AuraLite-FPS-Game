@@ -65,6 +65,11 @@ class ShaderProgram(name: String, vertexSrc: String, fragmentSrc: String) {
         if (loc >= 0) GLES30.glUniform3f(loc, x, y, z)
     }
 
+    fun setVec2(name: String, x: Float, y: Float) {
+        val loc = uniform(name)
+        if (loc >= 0) GLES30.glUniform2f(loc, x, y)
+    }
+
     fun setFloat(name: String, v: Float) {
         val loc = uniform(name)
         if (loc >= 0) GLES30.glUniform1f(loc, v)
