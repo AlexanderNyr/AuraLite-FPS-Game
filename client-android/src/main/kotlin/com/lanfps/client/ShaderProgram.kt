@@ -26,6 +26,7 @@ class ShaderProgram(name: String, vertexSrc: String, fragmentSrc: String) {
         GLES30.glBindAttribLocation(program, ATTRIB_POSITION, "aPos")
         GLES30.glBindAttribLocation(program, ATTRIB_NORMAL, "aNormal")
         GLES30.glBindAttribLocation(program, ATTRIB_COLOR, "aColor")
+        GLES30.glBindAttribLocation(program, ATTRIB_UV, "aUv")
         GLES30.glLinkProgram(program)
 
         val status = IntArray(1)
@@ -88,9 +89,16 @@ class ShaderProgram(name: String, vertexSrc: String, fragmentSrc: String) {
         return shader
     }
 
+    /** Sampler slot: binds a texture unit index (e.g. 0) to a sampler uniform. */
+    fun setSampler(name: String, unit: Int) {
+        val loc = uniform(name)
+        if (loc >= 0) GLES30.glUniform1i(loc, unit)
+    }
+
     companion object {
         const val ATTRIB_POSITION = 0
         const val ATTRIB_NORMAL = 1
         const val ATTRIB_COLOR = 2
+        const val ATTRIB_UV = 3
     }
 }

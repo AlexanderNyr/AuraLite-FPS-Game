@@ -19,7 +19,9 @@ class GameView(
     arena: ArenaDef,
 ) : GLSurfaceView(context) {
 
-    val gameRenderer = GameRenderer(state, arena)
+    // TextureLoader gets nothing but the AssetManager: it only opens streams,
+    // actual GL work is deferred to onSurfaceCreated on this view's GL thread.
+    val gameRenderer = GameRenderer(state, arena, TextureLoader(context.assets))
 
     init {
         setEGLContextClientVersion(3)

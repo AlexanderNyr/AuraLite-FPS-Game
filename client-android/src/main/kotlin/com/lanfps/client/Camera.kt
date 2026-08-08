@@ -45,8 +45,12 @@ class Camera {
     var near: Float = 0.06f
     var far: Float = 260f
 
+    /** Width / height of the viewport; the sky shader reconstructs rays with it. */
+    var aspect: Float = 1.6f
+        private set
+
     fun setPerspective(widthPx: Int, heightPx: Int) {
-        val aspect = if (heightPx <= 0) 1.6f else widthPx.toFloat() / heightPx.toFloat()
+        aspect = if (heightPx <= 0) 1.6f else widthPx.toFloat() / heightPx.toFloat()
         Matrix.perspectiveM(projection, 0, fovYDegrees, aspect, near, far)
     }
 

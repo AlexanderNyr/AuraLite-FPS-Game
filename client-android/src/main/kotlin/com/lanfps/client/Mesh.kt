@@ -7,8 +7,11 @@ import java.nio.FloatBuffer
  * A vertex buffer plus its vertex-array object.
  *
  * Two layouts exist, chosen by [hasNormals]:
- *  - lit    : position(3) normal(3) colour(3)  = 9 floats / vertex
- *  - unlit  : position(3) colour(3)            = 6 floats / vertex
+ *  - lit    : position(3) normal(3) colour(3) uv(2) = 11 floats / vertex
+ *  - unlit  : position(3) colour(3)                 = 6 floats / vertex
+ *
+ * Lit meshes always carry UVs now (the arena and the models are textured);
+ * unlit meshes (tracers, muzzle flash) intentionally do not.
  *
  * Static meshes upload once with GL_STATIC_DRAW; [DynamicMesh] re-uploads every
  * frame with GL_STREAM_DRAW for tracers and muzzle flashes.
@@ -23,7 +26,7 @@ open class Mesh(
     var vertexCount: Int = 0
         protected set
 
-    val floatsPerVertex: Int get() = if (hasNormals) 9 else 6
+    val floatsPerVertex: Int get() = if (hasNormals) MeshBuilder.LIT_FLOATS else MeshBuilder.UNLIT_FLOATS
     val strideBytes: Int get() = floatsPerVertex * GlUtil.FLOAT_BYTES
 
     protected var created = false
@@ -51,6 +54,11 @@ open class Mesh(
             GLES30.glVertexAttribPointer(
                 ShaderProgram.ATTRIB_COLOR, 3, GLES30.GL_FLOAT, false, stride,
                 6 * GlUtil.FLOAT_BYTES,
+            )
+            GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_UV)
+            GLES30.glVertexAttribPointer(
+                ShaderProgram.ATTRIB_UV, 2, GLES30.GL_FLOAT, false, stride,
+                9 * GlUtil.FLOAT_BYTES,
             )
         } else {
             GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_COLOR)
@@ -103,7 +111,9 @@ class DynamicMesh(
     drawMode: Int = GLES30.GL_TRIANGLES,
 ) : Mesh(hasNormals, drawMode) {
 
-    private val cpu = FloatArray(maxVertices * (if (hasNormals) 9 else 6))
+    private val cpu = FloatArray(
+        maxVertices * (if (hasNormals) MeshBuilder.LIT_FLOATS else MeshBuilder.UNLIT_FLOATS),
+    )
     private var head = 0
     private var allocated = false
 

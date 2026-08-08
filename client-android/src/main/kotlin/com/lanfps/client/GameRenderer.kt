@@ -26,13 +26,17 @@ import kotlin.math.sin
  * the simulation can never be stalled by a slow frame — if rendering drops to
  * 30 fps the network loop still ticks at a rock-steady 60 Hz.
  *
- * Everything is untextured flat-shaded geometry: four draw calls for the world
- * plus one per visible player. That is deliberate — it keeps the frame time low
- * on mid-range phones and means the APK ships no art assets at all.
+ * Geometry is still flat-shaded boxes, but every surface now carries a
+ * generated sci-fi texture (see `assets/textures/`): the texture acts as a
+ * detail layer multiplied by the original palette colour, so the look is a
+ * strictly-upgraded version of the old flat one. Each material is its own
+ * small mesh + draw call (~8 world draws total), still nothing for a GPU.
+ * The sky is a fullscreen triangle ray-cast against a panorama texture.
  */
 class GameRenderer(
     private val state: ClientGameState,
     @Volatile private var arena: ArenaDef,
+    private val textureLoader: TextureLoader,
 ) : GLSurfaceView.Renderer {
 
     /**
@@ -51,11 +55,24 @@ class GameRenderer(
     // ---- GL objects --------------------------------------------------------
     private var litShader: ShaderProgram? = null
     private var flatShader: ShaderProgram? = null
+    private var skyShader: ShaderProgram? = null
 
-    private val arenaMesh = Mesh(hasNormals = true)
+    /** One mesh per material id, so each can bind its own texture. */
+    private val materialMeshes = HashMap<Int, Mesh>(6)
+    private val spawnMesh = Mesh(hasNormals = true)
     private val playerMesh = Mesh(hasNormals = true)
     private val weaponMesh = Mesh(hasNormals = true)
+    // The sky needs UVs but not normals; the lit layout is the only one with
+    // UVs, so it piggy-backs on it (a handful of unused floats per vertex).
+    private val skyMesh = Mesh(hasNormals = true, drawMode = GLES30.GL_TRIANGLES)
     private val effectMesh = DynamicMesh(hasNormals = false, maxVertices = 6 * 64)
+
+    // ---- textures -----------------------------------------------------------
+    private val materialTex = HashMap<Int, Int>(6)
+    private var playerTex = 0
+    private var weaponTex = 0
+    private var skyTex = 0
+    private var whiteTex = 0
 
     private val camera = Camera()
     private val model = FloatArray(16)
@@ -88,7 +105,10 @@ class GameRenderer(
 
         litShader = ShaderProgram("lit", LIT_VS, LIT_FS)
         flatShader = ShaderProgram("flat", FLAT_VS, FLAT_FS)
+        skyShader = ShaderProgram("sky", SKY_VS, SKY_FS)
 
+        loadTextures()
+        buildSkyMesh()
         buildArenaMesh()
         buildPlayerMesh()
         buildWeaponMesh()
@@ -105,9 +125,102 @@ class GameRenderer(
         surfaceReady = true
         GlUtil.checkError("onSurfaceCreated")
         AndroidLog.i(
-            "renderer ready: arena=${arenaMesh.vertexCount} verts, " +
+            "renderer ready: arena=${materialMeshes.values.sumOf { it.vertexCount }} verts, " +
                 "player=${playerMesh.vertexCount} verts",
         )
+    }
+
+    /**
+     * One texture per material. The gain column compensates each texture's
+     * baked-in mean brightness so the classic palette is preserved verbatim —
+     * textures only add *detail*, never a global colour shift. The numbers are
+     * 1/mean-luma measured when the PNGs were processed for this APK.
+     */
+    private fun loadTextures() {
+        textureLoader.dispose() // harmless on first run, recovers after context loss
+        whiteTex = textureLoader.white()
+        materialTex[Material.FLOOR] = textureLoader.load("floor.png")
+        materialTex[Material.WALL] = textureLoader.load("wall.png")
+        materialTex[Material.CRATE] = textureLoader.load("crate.png", GLES30.GL_CLAMP_TO_EDGE)
+        materialTex[Material.PILLAR] = textureLoader.load("pillar.png")
+        materialTex[Material.COVER] = textureLoader.load("cover.png", GLES30.GL_CLAMP_TO_EDGE)
+        materialTex[Material.RAMP] = textureLoader.load("ramp.png")
+        playerTex = textureLoader.load("player.png")
+        weaponTex = textureLoader.load("weapon.png")
+        skyTex = textureLoader.load("sky.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
+    }
+
+    private fun texGain(material: Int): Float = when (material) {
+        Material.FLOOR -> 2.00f  // mean luma 0.50
+        Material.WALL -> 1.92f   // 0.52
+        Material.CRATE -> 1.92f  // 0.52
+        Material.PILLAR -> 1.92f // 0.52
+        Material.COVER -> 2.00f  // 0.50
+        Material.RAMP -> 1.92f   // 0.52
+        else -> 1.0f
+    }
+
+    /**
+     * A huge inward-facing cylinder plus a zenith fan, built once. Stars are
+     * NOT fogged and NOT lit; the texture's left/right edges were blended to
+     * wrap seamlessly. Radius 110 sits well inside the 260 m far plane, and the
+     * shell is drawn with depth-writes off so the world always occludes it.
+     *
+     * UV note: u spans 0..12 around the equator (12 horizontal repeats densify
+     * the star field), v runs bottom-up; v=0 is clamped to the horizon glow.
+     */
+    private fun buildSkyMesh() {
+        val b = MeshBuilder(withNormals = true, initialCapacity = 8192)
+        val radius = 110f
+        val yTop = 60f
+        val yBot = -34f
+        val segs = 24
+        val repeats = 12f
+        for (i in 0 until segs) {
+            val a0 = (i * Math.PI * 2 / segs).toFloat()
+            val a1 = ((i + 1) * Math.PI * 2 / segs).toFloat()
+            val x0 = cos(a0) * radius; val z0 = sin(a0) * radius
+            val x1 = cos(a1) * radius; val z1 = sin(a1) * radius
+            val u0 = i * repeats / segs
+            val u1 = (i + 1) * repeats / segs
+            // Winding is CCW *as seen from inside* (the camera is always
+            // inside the shell), so the front face survives backface culling.
+            val nx = -(x0 + x1); val nz = -(z0 + z1)
+            b.quad(
+                x0, yBot, z0,
+                x1, yBot, z1,
+                x1, yTop, z1,
+                x0, yTop, z0,
+                nx, 0f, nz,
+                1f, 1f, 1f,
+                u0, 0f,
+                u1, 0f,
+                u1, 1f,
+                u0, 1f,
+            )
+        }
+        // Zenith disc: closes the hole at the top of the cylinder. It samples
+        // a small patch near the texture's top edge — dim, uniform sky.
+        for (i in 0 until segs) {
+            val a0 = (i * Math.PI * 2 / segs).toFloat()
+            val a1 = ((i + 1) * Math.PI * 2 / segs).toFloat()
+            val x0 = cos(a0) * radius; val z0 = sin(a0) * radius
+            val x1 = cos(a1) * radius; val z1 = sin(a1) * radius
+            b.quad(
+                0f, yTop, 0f,
+                x0, yTop, z0,
+                x1, yTop, z1,
+                0f, yTop, 0f,
+                0f, -1f, 0f,
+                1f, 1f, 1f,
+                0f, 0.86f,
+                0.10f, 0.86f,
+                0.10f, 0.92f,
+                0f, 0.86f,
+            )
+        }
+        skyMesh.upload(b.raw(), b.floatCount)
+        AndroidLog.i("sky mesh: ${skyMesh.vertexCount} verts")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -151,6 +264,7 @@ class GameRenderer(
 
         val lit = litShader ?: return
         val flat = flatShader ?: return
+        val sky = skyShader ?: return
 
         val playing = state.phase == Phase.PLAYING || state.phase == Phase.ENDED
         val nowMs = System.currentTimeMillis()
@@ -161,6 +275,19 @@ class GameRenderer(
         if (playing && !state.alive) applySpectatorCamera()
         state.publishViewProj(camera.viewProjection)
 
+        // ---- sky ------------------------------------------------------------
+        // Drawn first with depth writes off: the world overwrites it wherever
+        // geometry exists, so the shell acts as a pure backdrop. Not fogged and
+        // not lit — see SKY_FS.
+        sky.use()
+        sky.setMatrix("uViewProj", camera.viewProjection)
+        sky.setSampler("uTex", 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, skyTex)
+        GLES30.glDepthMask(false)
+        skyMesh.draw()
+        GLES30.glDepthMask(true)
+
         // ---- world ---------------------------------------------------------
         lit.use()
         lit.setMatrix("uViewProj", camera.viewProjection)
@@ -169,10 +296,20 @@ class GameRenderer(
         lit.setFloat("uFogDensity", if (playing) 0.0075f else 0.0045f)
         lit.setVec3("uEye", camera.x, camera.y, camera.z)
         lit.setFloat("uAmbient", 0.55f)
-
+        lit.setSampler("uTex", 0)
         lit.setMatrix("uModel", identity)
         lit.setVec3("uTint", 1f, 1f, 1f)
-        arenaMesh.draw()
+
+        for ((material, mesh) in materialMeshes) {
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, materialTex[material] ?: whiteTex)
+            lit.setFloat("uTexGain", texGain(material))
+            mesh.draw()
+        }
+
+        // Spawn strips bind the white 1x1: detail layer = 1.0, pure palette.
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
+        lit.setFloat("uTexGain", 1.0f)
+        spawnMesh.draw()
 
         // ---- players --------------------------------------------------------
         // P2-5: the body we are spectating must BE drawn - first-person for
@@ -322,7 +459,12 @@ class GameRenderer(
         val hp = MathUtil.clamp(e.health / GameConstants.MAX_HEALTH.toFloat(), 0f, 1f)
         val k = 0.55f + 0.45f * hp
         lit.setVec3("uTint", r * k, g * k, b * k)
+        // Light armour plating, tinted by team colour; gain = 1/0.55 luma.
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, playerTex)
+        lit.setFloat("uTexGain", 1.82f)
         playerMesh.draw()
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
+        lit.setFloat("uTexGain", 1.0f)
     }
 
     private fun drawWeapon(lit: ShaderProgram) {
@@ -366,7 +508,13 @@ class GameRenderer(
         lit.setMatrix("uModel", scratch)
         lit.setVec3("uTint", tintR, tintG, tintB)
         lit.setFloat("uFogDensity", 0f)
+        // Gunmetal detail layer; gain = 1/0.45 luma (weapon texture is
+        // deliberately darker so the small readout dots pop).
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, weaponTex)
+        lit.setFloat("uTexGain", 2.22f)
         weaponMesh.draw()
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
+        lit.setFloat("uTexGain", 1.0f)
         lit.setFloat("uFogDensity", 0.0075f)
     }
 
@@ -441,12 +589,36 @@ class GameRenderer(
 
     // ------------------------------------------------------------ mesh build
 
-    private fun buildArenaMesh() {
-        val b = MeshBuilder(withNormals = true, initialCapacity = 1 shl 16)
+    /**
+     * What UV treatment a material gets: FIT stretches one texture over each
+     * face (crates and cover, assets generated with a coherent border), TILED
+     * repeats in world space every [uvScale] metres. Scales are chosen so the
+     * panel pitch looks natural on this project's boxy geometry.
+     */
+    private class MatStyle(val mode: MeshBuilder.UvMode, val uvScale: Float)
 
-        // Tiled floor: a checker of 4 m tiles reads as distance far better than a
-        // single flat quad, and costs one extra draw call of nothing.
+    private fun matStyle(material: Int): MatStyle = when (material) {
+        Material.WALL -> MatStyle(MeshBuilder.UvMode.TILED, 3f)   // 3 m panels
+        Material.CRATE -> MatStyle(MeshBuilder.UvMode.FIT, 1f)
+        Material.PILLAR -> MatStyle(MeshBuilder.UvMode.TILED, 2f)
+        Material.COVER -> MatStyle(MeshBuilder.UvMode.FIT, 1f)
+        Material.RAMP -> MatStyle(MeshBuilder.UvMode.TILED, 2f)
+        else -> MatStyle(MeshBuilder.UvMode.TILED, 3f)
+    }
+
+    private fun buildArenaMesh() {
+        // One builder per material id; keeps each texture's geometry together
+        // so the draw loop is a simple per-material bind+draw.
+        val builders = HashMap<Int, MeshBuilder>(6)
+        fun builderFor(material: Int) = builders.getOrPut(material) {
+            MeshBuilder(withNormals = true, initialCapacity = 1 shl 13)
+        }
+
+        // Tiled floor: still a 4 m checker (the colour alternation survives as
+        // a tint over the metal texture, which reads great) but each tile now
+        // gets tiled UVs: one texture repeat every 2 metres.
         val tile = 4f
+        val floorB = builderFor(Material.FLOOR)
         var z = arena.minZ
         var row = 0
         while (z < arena.maxZ - 0.001f) {
@@ -457,7 +629,7 @@ class GameRenderer(
                 val x1 = min(x + tile, arena.maxX)
                 val dark = ((row + col) and 1) == 0
                 val c = if (dark) 0.148f else 0.178f
-                b.floorTile(x, z, x1, z1, 0f, c, c * 1.06f, c * 1.22f)
+                floorB.floorTile(x, z, x1, z1, 0f, c, c * 1.06f, c * 1.22f, uvScale = 2f)
                 x = x1
                 col++
             }
@@ -469,26 +641,46 @@ class GameRenderer(
             // The floor brush is replaced by the tiled grid above.
             if (brush.material == Material.FLOOR) continue
             val (r, g, bb) = materialColour(brush.material)
-            b.box(brush.box, r, g, bb, shadeBottom = brush.box.sizeY > 1.2f)
+            val style = matStyle(brush.material)
+            builderFor(brush.material).box(
+                brush.box, r, g, bb,
+                shadeBottom = brush.box.sizeY > 1.2f,
+                uvMode = style.mode,
+                uvScale = style.uvScale,
+            )
         }
 
-        // Coloured strips on the ground in front of each spawn: a readable,
-        // asset-free way to show whose side of the map you are on.
+        // Upload per-material meshes, recycling old ones (a map rotation
+        // rebuild must not leak VBOs).
+        for (old in materialMeshes.values) old.dispose()
+        materialMeshes.clear()
+        for ((material, builder) in builders) {
+            val mesh = Mesh(hasNormals = true)
+            mesh.upload(builder.raw(), builder.floatCount)
+            materialMeshes[material] = mesh
+        }
+
+        // Coloured strips on the ground in front of each spawn: kept flat and
+        // untextured (they bind the white 1x1) so team colours stay pure and
+        // readable from spawn-room doorways.
+        val sb = MeshBuilder(withNormals = true, initialCapacity = 2048)
         for (s in arena.spawns) {
             val (r, g, bb) = when (s.team) {
                 Team.RED -> Triple(0.42f, 0.14f, 0.12f)
                 Team.BLUE -> Triple(0.12f, 0.20f, 0.44f)
                 else -> Triple(0.24f, 0.24f, 0.26f)
             }
-            b.box(
+            sb.box(
                 s.position.x - 1.1f, 0.001f, s.position.z - 1.1f,
                 s.position.x + 1.1f, 0.02f, s.position.z + 1.1f,
                 r, g, bb,
             )
         }
-
-        arenaMesh.upload(b.raw(), b.floatCount)
-        AndroidLog.i("arena mesh: ${arenaMesh.vertexCount} vertices")
+        spawnMesh.upload(sb.raw(), sb.floatCount)
+        AndroidLog.i(
+            "arena mesh: ${materialMeshes.values.sumOf { it.vertexCount }} verts " +
+                "in ${materialMeshes.size} material meshes + spawn strips",
+        )
     }
 
     private fun materialColour(material: Int): Triple<Float, Float, Float> = when (material) {
@@ -560,10 +752,15 @@ class GameRenderer(
         surfaceReady = false
         litShader?.dispose()
         flatShader?.dispose()
-        arenaMesh.dispose()
+        skyShader?.dispose()
+        for (mesh in materialMeshes.values) mesh.dispose()
+        materialMeshes.clear()
+        spawnMesh.dispose()
+        skyMesh.dispose()
         playerMesh.dispose()
         weaponMesh.dispose()
         effectMesh.dispose()
+        textureLoader.dispose()
     }
 
     companion object {
@@ -585,14 +782,17 @@ class GameRenderer(
             in vec3 aPos;
             in vec3 aNormal;
             in vec3 aColor;
+            in vec2 aUv;
             out vec3 vNormal;
             out vec3 vColor;
             out vec3 vWorld;
+            out vec2 vUv;
             void main() {
                 vec4 world = uModel * vec4(aPos, 1.0);
                 vWorld  = world.xyz;
                 vNormal = mat3(uModel) * aNormal;
                 vColor  = aColor;
+                vUv     = aUv;
                 gl_Position = uViewProj * world;
             }
         """
@@ -605,9 +805,12 @@ class GameRenderer(
             uniform vec3  uFogColor;
             uniform float uFogDensity;
             uniform vec3  uEye;
+            uniform sampler2D uTex;
+            uniform float uTexGain;
             in vec3 vNormal;
             in vec3 vColor;
             in vec3 vWorld;
+            in vec2 vUv;
             out vec4 fragColor;
             void main() {
                 vec3 n = normalize(vNormal);
@@ -616,11 +819,43 @@ class GameRenderer(
                 // readable without a second light or any shadow mapping.
                 float hemi = 0.55 + 0.45 * n.y;
                 float light = uAmbient * hemi + (1.0 - uAmbient) * lambert;
-                vec3 c = vColor * uTint * light;
+                // The texture is a greyscale-ish detail layer: uTexGain restores
+                // the palette brightness (1/mean-luma), so the original vertex
+                // colours survive texturing and a white 1x1 fallback texture is
+                // a silent no-op returning the pre-texture look.
+                vec3 detail = texture(uTex, vUv).rgb * uTexGain;
+                vec3 c = vColor * detail * uTint * light;
                 float dist = length(vWorld - uEye);
                 float fog = 1.0 - exp(-uFogDensity * dist);
                 c = mix(c, uFogColor, clamp(fog, 0.0, 1.0));
                 fragColor = vec4(c, 1.0);
+            }
+        """
+
+        /**
+         * Sky shell: one textured inward-facing cylinder around the arena, drawn
+         * first with depth writes off. Unlit and unfogged on purpose — fogging
+         * the sky would crush the stars into murk; the fog-tinted world already
+         * blends toward the same dark palette at distance.
+         */
+        private const val SKY_VS = """#version 300 es
+            uniform mat4 uViewProj;
+            in vec3 aPos;
+            in vec2 aUv;
+            out vec2 vUv;
+            void main() {
+                vUv = aUv;
+                gl_Position = uViewProj * vec4(aPos, 1.0);
+            }
+        """
+
+        private const val SKY_FS = """#version 300 es
+            precision mediump float;
+            uniform sampler2D uTex;
+            in vec2 vUv;
+            out vec4 fragColor;
+            void main() {
+                fragColor = vec4(texture(uTex, vUv).rgb, 1.0);
             }
         """
 
