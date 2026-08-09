@@ -131,6 +131,7 @@ class GameRenderer(
     private val materialTex = HashMap<Int, Int>(6)
     private var playerTex = 0
     private var weaponTex = 0
+    private var grenadeTex = 0
     private var skyTexDay = 0
     private var skyTexNight = 0
     private var whiteTex = 0
@@ -270,6 +271,8 @@ class GameRenderer(
         materialTex[Material.RAMP] = textureLoader.load("ramp.png")
         playerTex = textureLoader.load("player.png")
         weaponTex = textureLoader.load("weapon.png")
+        // P9: pineapple-shell texture for the spherical grenade.
+        grenadeTex = textureLoader.load("grenade.png")
         // P8: day is the default; the night panorama ships alongside for the
         // server-picked night preset (both are tiny generated panoramas).
         skyTexDay = textureLoader.load("sky.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
@@ -621,17 +624,25 @@ class GameRenderer(
             GLES30.glDisable(GLES30.GL_BLEND)
         }
 
-        // ---- weapon viewmodel -------------------------------------------------
+        // Post pipeline: resolve, bloom, grade, present — or a no-op fallback.
+        if (postFx.ready) postFx.endSceneAndCompose()
+
+        // ---- weapon viewmodel: its own final pass straight to the screen ----
+        // P9: the gun no longer renders into the offscreen MSAA buffer but as a
+        // dedicated pass AFTER the post pipeline (and, without post, right after
+        // the effects batch). That removes the whole flicker class: the
+        // viewmodel cannot be eaten by an MSAA resolve hiccup, the cleared
+        // depth stops it sinking into nearby walls, and NaN-guarded inputs in
+        // updateGameCamera/drawWeapon keep one bad float from dropping the
+        // whole matrix for a frame.
         if (playing && state.alive) {
-            // Clear depth so the gun can never clip through a wall the player is
-            // standing against - the classic FPS trick, and much cheaper than a
-            // second depth range.
+            GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+            GLES30.glDisable(GLES30.GL_BLEND)
+            GLES30.glEnable(GLES30.GL_CULL_FACE)
+            GLES30.glDepthMask(true)
             GLES30.glClear(GLES30.GL_DEPTH_BUFFER_BIT)
             drawWeapon(lit)
         }
-
-        // Post pipeline: resolve, bloom, grade, present — or a no-op fallback.
-        if (postFx.ready) postFx.endSceneAndCompose()
     }
 
     /**
@@ -928,15 +939,19 @@ class GameRenderer(
         val snap = state.snapshots.latest
         val list = snap?.grenades ?: emptyList<GrenadeState>()
 
-        // Fat acorn: dark body; fuse nearing its end blinks a fast hot warn.
-        lit.setFloat("uSpec", 0.1f)
+        // P9: segmented olive shell on a real sphere. texGain = 1/0.2975 (the
+        // texture's mean luma) keeps the palette brightness pre-texture; the
+        // green body and the hot fuse blink still come from uTint.
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, grenadeTex)
+        lit.setFloat("uTexGain", 3.36f)
+        lit.setFloat("uSpec", 0.35f)
         for (g in list) {
             val blink = g.fuseTicks > 30 && ((nowMs / 90L) and 1L) == 0L
             if (blink) {
                 lit.setVec3("uTint", 0.85f, 0.22f, 0.12f)
                 lit.setFloat("uEmissive", 0.9f)
             } else {
-                lit.setVec3("uTint", 0.16f, 0.16f, 0.18f)
+                lit.setVec3("uTint", 0.14f, 0.18f, 0.12f)
                 lit.setFloat("uEmissive", 0.12f)
             }
             Matrix.setIdentityM(model, 0)
@@ -949,6 +964,8 @@ class GameRenderer(
         }
         lit.setFloat("uEmissive", 0.0f)
         lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uTexGain", 1.0f)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setVec3("uTint", 1f, 1f, 1f)
         lit.setMatrix("uModel", identity)
 
@@ -1090,8 +1107,10 @@ class GameRenderer(
         val bobX = sin(bobPhase) * 0.012f * moveT
         val bobY = -abs(cos(bobPhase)) * 0.014f * moveT
 
-        // Recoil pushes the gun back and up.
-        val kick = weaponKick
+        // Recoil pushes the gun back and up. (NaN-guarded: one poisoned float
+        // must never zero the whole viewmodel matrix for a frame.)
+        val rawKick = weaponKick
+        val kick = if (rawKick.isNaN() || rawKick.isInfinite()) 0f else rawKick
         val offZ = -kick * 0.035f
         val offY = kick * 0.010f
 
@@ -1127,6 +1146,18 @@ class GameRenderer(
         Matrix.scaleM(scratch, 0, scaleX, scaleY, scaleZ)
         Matrix.multiplyMM(scratch, 0, model, 0, scratch, 0)
 
+        // P9: drawn after the post pipeline, so no world uniforms are live —
+        // rebind the lit program and re-push the frame constants it relies on.
+        lit.use()
+        lit.setMatrix("uViewProj", camera.viewProjection)
+        lit.setVec3("uLightDir", LIGHT_X, LIGHT_Y, LIGHT_Z)
+        lit.setVec3("uFogColor", fogR, fogG, fogB)
+        lit.setVec3("uEye", camera.x, camera.y, camera.z)
+        lit.setFloat("uAmbient", ambientLight)
+        lit.setSampler("uTex", 0)
+        // Muzzle/explosion light still plays over the viewmodel in this pass.
+        val playingNow = state.phase == Phase.PLAYING || state.phase == Phase.ENDED
+        updatePointLight(lit, System.currentTimeMillis(), playingNow)
         lit.setMatrix("uModel", scratch)
         lit.setVec3("uTint", tintR, tintG, tintB)
         lit.setFloat("uFogDensity", 0f)
@@ -1615,17 +1646,69 @@ class GameRenderer(
 
     /**
      * Reusable unit geometry for the P4 set: a 0.34 m pickup cube (tinted per
-     * kind at draw time) and a 0.16 m dark grenade ball. Colours here are
-     * neutral multipliers — uTint does the real work.
+     * kind at draw time) and a proper UV-SPHERE grenade (P9 — replaces the
+     * old box): 16 longitude segments x 10 latitude rings so the silhouette
+     * stays round even in close-up, radial normals for correct lighting, and
+     * full UVs for the pineapple-shell texture. Vertex colours are neutral
+     * multipliers — uTint does the real work.
      */
     private fun buildContentPackMeshes() {
         val cube = MeshBuilder(withNormals = true, initialCapacity = 512)
         cube.box(-0.17f, -0.17f, -0.17f, 0.17f, 0.17f, 0.17f, 1f, 1f, 1f)
         pickupCube.upload(cube.raw(), cube.floatCount)
 
-        val ball = MeshBuilder(withNormals = true, initialCapacity = 512)
-        ball.box(-0.08f, -0.08f, -0.08f, 0.08f, 0.08f, 0.08f, 1f, 1f, 1f)
+        val ball = MeshBuilder(withNormals = true, initialCapacity = 1024)
+        buildUnitSphere(ball, 0.10f, 16, 10)
         grenodeMesh.upload(ball.raw(), ball.floatCount)
+    }
+
+    /**
+     * P9: lat/long UV sphere at the origin. Rings run pole to pole; each quad
+     * is split into two triangles with radial normals, so specular and the
+     * hemisphere term roll over the ball exactly like on a real round body.
+     * UVs wrap the shell once (the texture is seam-safe horizontally).
+     */
+    private fun buildUnitSphere(b: MeshBuilder, radius: Float, segs: Int, rings: Int) {
+        for (r in 0 until rings) {
+            val v0 = r.toFloat() / rings
+            val v1 = (r + 1).toFloat() / rings
+            val th0 = v0 * Math.PI.toFloat()        // 0 (top) .. PI (bottom)
+            val th1 = v1 * Math.PI.toFloat()
+            val sy0 = cos(th0); val rr0 = sin(th0)
+            val sy1 = cos(th1); val rr1 = sin(th1)
+            for (s in 0 until segs) {
+                val u0 = s.toFloat() / segs
+                val u1 = (s + 1).toFloat() / segs
+                val ph0 = u0 * (2f * Math.PI.toFloat())
+                val ph1 = u1 * (2f * Math.PI.toFloat())
+
+                // corners: (ring i, seg j)
+                val n00x = rr0 * cos(ph0); val n00z = rr0 * sin(ph0)
+                val n01x = rr0 * cos(ph1); val n01z = rr0 * sin(ph1)
+                val n10x = rr1 * cos(ph0); val n10z = rr1 * sin(ph0)
+                val n11x = rr1 * cos(ph1); val n11z = rr1 * sin(ph1)
+
+                fun vert(nx: Float, ny: Float, nz: Float, uu: Float, vv: Float) {
+                    b.vertex(
+                        nx * radius, ny * radius, nz * radius,
+                        nx, ny, nz,
+                        1f, 1f, 1f,
+                        uu, vv,
+                    )
+                }
+
+                // CCW seen from OUTSIDE (verified numerically: cross points
+                // outward; GL glFrontFace CCW + cull-back).
+                // triangle 1: (00),(11),(10)
+                vert(n00x, sy0, n00z, u0, v0)
+                vert(n11x, sy1, n11z, u1, v1)
+                vert(n10x, sy1, n10z, u0, v1)
+                // triangle 2: (00),(01),(11)
+                vert(n00x, sy0, n00z, u0, v0)
+                vert(n01x, sy0, n01z, u1, v0)
+                vert(n11x, sy1, n11z, u1, v1)
+            }
+        }
     }
 
     /** First-person weapon, modelled in view space (-Z points where you aim). */
