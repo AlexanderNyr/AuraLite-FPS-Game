@@ -61,7 +61,34 @@ class TextureLoader(private val assets: AssetManager) {
             GLES30.GL_LINEAR_MIPMAP_LINEAR,
         )
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        applyAnisotropy()
         return id
+    }
+
+    /**
+     * P8-4: anisotropic filtering where the driver offers it (the EXT is
+     * present on virtually every GLES3 phone). 4x sharpens the floor/walls at
+     * grazing angles — the biggest remaining source of blur at sprint speeds.
+     * Queried once per GL context, re-queried after context loss.
+     */
+    private fun applyAnisotropy() {
+        val supported = anisoSupported ?: run {
+            val exts = try {
+                GLES30.glGetString(GL_EXTENSIONS) ?: ""
+            } catch (t: Throwable) {
+                ""
+            }
+            exts.contains("GL_EXT_texture_filter_anisotropic").also {
+                anisoSupported = it
+                AndroidLog.i("anisotropic filtering: ${if (it) "enabled (4x)" else "not supported"}")
+            }
+        }
+        if (!supported) return
+        try {
+            GLES30.glTexParameterf(GLES30.GL_TEXTURE_2D, TEXTURE_MAX_ANISOTROPY_EXT, 4f)
+        } catch (t: Throwable) {
+            anisoSupported = false
+        }
     }
 
     /**
@@ -92,9 +119,18 @@ class TextureLoader(private val assets: AssetManager) {
 
     /** Deletes every texture this loader produced. Call on the GL thread. */
     fun dispose() {
+        // The new context may sit on a different driver: re-probe the EXT.
+        anisoSupported = null
         if (ids.isEmpty()) return
         val arr = ids.toIntArray()
         GLES30.glDeleteTextures(arr.size, arr, 0)
         ids.clear()
+    }
+
+    companion object {
+        /** Per-context EXT probe result; null = not yet queried. */
+        @Volatile private var anisoSupported: Boolean? = null
+        private const val GL_EXTENSIONS = 0x1F03
+        private const val TEXTURE_MAX_ANISOTROPY_EXT = 0x84FE
     }
 }

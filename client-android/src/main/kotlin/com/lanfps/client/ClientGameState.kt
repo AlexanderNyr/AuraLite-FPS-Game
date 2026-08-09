@@ -78,6 +78,10 @@ class ClientGameState(@JvmField var arena: ArenaDef) {
     @Volatile var localPlayerId: Int = -1
     @Volatile var localTeam: Team = Team.NONE
     @Volatile var serverName: String = "LAN FPS Server"
+
+    /** P8: lighting preset picked by the server ([com.lanfps.shared.TimeOfDay]).
+     *  The renderer watches this and hot-swaps sky/light uniforms. */
+    @Volatile var timeOfDay: Int = 0
     @Volatile var arenaMismatch: Boolean = false
 
     /** P0-2: token from CONNECT_ACCEPTED, presented to resume this session. */

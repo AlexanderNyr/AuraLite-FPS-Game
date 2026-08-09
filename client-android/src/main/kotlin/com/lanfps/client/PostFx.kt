@@ -24,6 +24,35 @@ import android.opengl.GLES30
  */
 class PostFx {
 
+    // ---- P8 day/night presets --------------------------------------------
+    // The GameRenderer pushes these whenever the server-picked lighting
+    // preset changes; defaults are the daylight look.
+    /** Luminance above which a fragment joins the bloom chain. Day: the sky
+     *  band and haze fog sit at 0.7+ luma and must NOT halo — bloom stays
+     *  reserved for the sun disc, visors, tracers and flashes. Night: a
+     *  darker scene lets neon and muzzle flash bloom from much lower luma. */
+    private var bloomThreshold = 0.74f
+    /** Pre-tonemap exposure. Day: above 1.0 — the exponential shoulder eats
+     *  the mids and a sunlit arena must land bright. Night: well under, so
+     *  the same albedos read as moonlit. */
+    private var exposure = 1.20f
+    /** Corner darkening at the frame edge; lighter in daylight so the frame
+     *  reads as airy rather than tunnelled. */
+    private var vignette = 0.22f
+
+    /** P8: switches the grading constants between the day and night looks. */
+    fun applyPreset(night: Boolean) {
+        if (night) {
+            bloomThreshold = 0.45f
+            exposure = 0.62f
+            vignette = 0.30f
+        } else {
+            bloomThreshold = 0.74f
+            exposure = 1.20f
+            vignette = 0.22f
+        }
+    }
+
     /** True once every FBO validated; the renderer branches on this. */
     var ready = false
         private set
@@ -139,7 +168,7 @@ class PostFx {
         // 2) bright pass into A
         bindFboViewport(bloomFboA, bloomW, bloomH)
         bright.use()
-        bright.setFloat("uThreshold", BLOOM_THRESHOLD)
+        bright.setFloat("uThreshold", bloomThreshold)
         bright.setFloat("uKnee", BLOOM_KNEE)
         bright.setSampler("uTex", 0)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -170,9 +199,9 @@ class PostFx {
         compose.use()
         compose.setSampler("uScene", 0)
         compose.setSampler("uBloom", 1)
-        compose.setFloat("uExposure", EXPOSURE)
+        compose.setFloat("uExposure", exposure)
         compose.setFloat("uBloomStrength", BLOOM_STRENGTH)
-        compose.setFloat("uVignette", VIGNETTE)
+        compose.setFloat("uVignette", vignette)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexB)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
@@ -329,27 +358,11 @@ class PostFx {
     }
 
     companion object {
-        /**
-         * Luminance above which a fragment joins the bloom chain. Raised for
-         * the daylight scene: the sky band and haze fog sit at 0.7+ luma and
-         * must NOT halo — bloom stays reserved for the sun disc, visors,
-         * tracers and muzzle flashes.
-         */
-        private const val BLOOM_THRESHOLD = 0.74f
-
         /** Soft knee width: halo grows smoothly instead of clipping. */
         private const val BLOOM_KNEE = 0.55f
 
         /** Bloom contribution in the composite; 0.4 ≈ visible but not haze. */
         private const val BLOOM_STRENGTH = 0.42f
-
-        /** Pre-tonemap exposure. Above the old night value: the exponential
-         * shoulder eats the mids, and a sunlit arena has to land bright. */
-        private const val EXPOSURE = 1.20f
-
-        /** Corner darkening at the frame edge; lighter in daylight so the
-         * frame reads as airy rather than tunnelled. */
-        private const val VIGNETTE = 0.22f
 
         /** Attribute-less fullscreen triangle sourced from gl_VertexID. */
         private const val FULLSCREEN_VS = """#version 300 es

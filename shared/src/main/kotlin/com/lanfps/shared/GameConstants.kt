@@ -163,3 +163,21 @@ object GameConstants {
     /** Entity ids >= this belong to bots. Keeps id spaces from colliding. */
     const val BOT_ID_BASE: Int = 1000
 }
+
+/**
+ * P8: world-lighting preset chosen by the SERVER (all clients in a match see
+ * the same sky). Sent as plain wire values in CONNECT_ACCEPTED and
+ * LOBBY_STATE, both as trailing fields, so mixed builds interoperate: an old
+ * server simply defaults every client to DAY. Purely presentational — the
+ * simulation never branches on it.
+ */
+object TimeOfDay {
+    const val DAY: Int = 0
+    const val NIGHT: Int = 1
+
+    fun parse(raw: String): Int? = when (raw.trim().lowercase()) {
+        "day" -> DAY
+        "night" -> NIGHT
+        else -> null
+    }
+}

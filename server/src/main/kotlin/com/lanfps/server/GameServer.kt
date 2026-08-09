@@ -422,6 +422,7 @@ class GameServer(private val config: ServerConfig) {
             assignedNickname = session.nickname
             arenaHash = world.serverArena.def.hash()
             resumeToken = session.resumeToken
+            timeOfDay = config.timeOfDayWire()
         }
         Protocol.begin(writer, PacketTypes.CONNECT_ACCEPTED)
         Packets.writeConnectAccepted(writer, accepted)
@@ -641,6 +642,8 @@ class GameServer(private val config: ServerConfig) {
             killLimit = config.killLimit
             votesDm = votesFor(GameMode.DM)
             votesTdm = votesFor(GameMode.TDM)
+            // P8: clients switch their sky/lighting preset off this.
+            timeOfDay = config.timeOfDayWire()
         }
         for (e in world.score.standings(world.entities.values)) {
             lobby.players.add(

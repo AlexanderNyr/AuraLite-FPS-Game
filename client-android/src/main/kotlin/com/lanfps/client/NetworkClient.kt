@@ -301,6 +301,9 @@ class NetworkClient(
         state.mode = GameMode.fromWire(acc.mode)
         state.nickname = acc.assignedNickname.ifEmpty { state.nickname }
         state.lastServerContactMs = System.currentTimeMillis()
+        // P8: the server's lighting preset (day/night) — the renderer swaps
+        // sky presets when this changes.
+        state.timeOfDay = acc.timeOfDay
 
         // P0-2: remember the resume token; P0-1: register our own name in the
         // roster (names no longer travel inside snapshots).
@@ -1029,6 +1032,8 @@ class NetworkClient(
                         state.killLimit = lobby.killLimit
                         state.votesDm = lobby.votesDm
                         state.votesTdm = lobby.votesTdm
+                        // P8: kept fresh by every lobby broadcast.
+                        state.timeOfDay = lobby.timeOfDay
                         // P0-1: LOBBY_STATE is now the ONLY place names arrive.
                         for (p in lobby.players) state.setRosterName(p.id, p.name)
                     }

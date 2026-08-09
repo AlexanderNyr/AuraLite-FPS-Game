@@ -98,6 +98,9 @@ object Packets {
         @JvmField var arenaHash: Int = 0
         /** P0-2: the token to present on a future reconnect (0 = not yet). */
         @JvmField var resumeToken: Int = 0
+        /** P8: server-picked world lighting, [TimeOfDay] wire (0=day, 1=night).
+         *  Trailing field: old servers do not send it (guarded read → day). */
+        @JvmField var timeOfDay: Int = 0
     }
 
     fun writeConnectAccepted(w: BinaryWriter, a: ConnectAccepted) {
@@ -111,6 +114,7 @@ object Packets {
         w.writeString(a.assignedNickname, GameConstants.MAX_NICKNAME_LENGTH * 4)
         w.writeI32(a.arenaHash)
         w.writeI32(a.resumeToken)
+        w.writeU8(a.timeOfDay)
     }
 
     fun readConnectAccepted(r: BinaryReader): ConnectAccepted {
@@ -125,6 +129,7 @@ object Packets {
         a.assignedNickname = r.readString()
         a.arenaHash = r.readI32()
         a.resumeToken = r.readI32()
+        if (r.hasRemaining()) a.timeOfDay = r.readU8()
         return a
     }
 
@@ -295,6 +300,10 @@ object Packets {
         @JvmField var votesDm: Int = 0
         @JvmField var votesTdm: Int = 0
 
+        /** P8: world lighting preset (0=day, 1=night); rides the 500 ms lobby
+         *  broadcast so late-joining/reconnecting clients pick it up too. */
+        @JvmField var timeOfDay: Int = 0
+
         @JvmField var players: ArrayList<LobbyPlayer> = ArrayList()
     }
 
@@ -321,6 +330,8 @@ object Packets {
             w.writeU16(MathUtil.clamp(p.deaths, 0, 65535))
             w.writeU16(MathUtil.clamp(p.pingMs, 0, 65535))
         }
+        // P8 trailing field: old servers stop at the player loop (guarded read).
+        w.writeU8(l.timeOfDay)
     }
 
     fun readLobbyState(r: BinaryReader, out: LobbyState = LobbyState()): LobbyState {
@@ -347,6 +358,8 @@ object Packets {
             p.pingMs = r.readU16()
             out.players.add(p)
         }
+        // P8 trailing field absent on wire = day (old server build).
+        out.timeOfDay = if (r.hasRemaining()) r.readU8() else 0
         return out
     }
 

@@ -307,6 +307,7 @@ run-server.bat --selfTestSeconds=10     REM headless smoke test, no clients need
 | `--botDifficulty` | `0.55` | 0.0 easy → 1.0 hard — the mean; each bot gets its own offset |
 | `--infiniteAmmo` | `false` | `true` = classic bottomless magazines |
 | `--mapRotation` | *(empty)* | comma-separated maps rotated between matches (P2-3) |
+| `--timeOfDay` | `day` | `day` = sunlit arena, `night` = dark sky + neon preset on every client (P8, visual only) |
 | `--password` | *(empty)* | optional plain-text door lock for a private LAN (P0-3) |
 | `--statsCsv` | *(empty)* | append server metrics to this CSV every 10 s (P3-3) |
 | `--enableDiscovery` | `true` | answer LAN broadcast (SCAN button) |

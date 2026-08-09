@@ -2,6 +2,7 @@ package com.lanfps.server
 
 import com.lanfps.shared.GameConstants
 import com.lanfps.shared.GameMode
+import com.lanfps.shared.TimeOfDay
 import java.io.File
 import java.util.Properties
 
@@ -86,6 +87,16 @@ class ServerConfig {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
 
+    /**
+     * P8: world lighting the clients render — "day" (default) or "night".
+     * Purely presentational: sent in CONNECT_ACCEPTED / LOBBY_STATE so every
+     * phone in the match sees the same sky; the simulation never reads it.
+     */
+    var timeOfDay: String = "day"
+
+    /** P8 wire form (see [com.lanfps.shared.TimeOfDay]). */
+    fun timeOfDayWire(): Int = TimeOfDay.parse(timeOfDay) ?: TimeOfDay.DAY
+
     /** P0-3 (optional): plain-text password; empty = open server (default). */
     var password: String = ""
 
@@ -106,6 +117,7 @@ class ServerConfig {
         append(" matchTime=").append(matchTimeSeconds).append("s")
         append(" killLimit=").append(killLimit)
         append(" discovery=").append(enableDiscovery)
+        append(" timeOfDay=").append(timeOfDay)
     }
 
     private fun applyProperties(p: Properties) {
@@ -133,6 +145,7 @@ class ServerConfig {
         p.getProperty("deltaCompression")?.let { deltaCompression = it.trim().toBoolean() }
         p.getProperty("infiniteAmmo")?.let { infiniteAmmo = it.trim().toBoolean() }
         p.getProperty("mapRotation")?.let { mapRotation = it.trim() }
+        p.getProperty("timeOfDay")?.let { timeOfDay = it.trim().lowercase() }
         p.getProperty("password")?.let { password = it.trim().take(32) }
         p.getProperty("statsCsv")?.let { statsCsv = it.trim() }
         p.getProperty("logLevel")?.let { logLevel = it.trim() }
@@ -173,6 +186,10 @@ class ServerConfig {
         maxConnectsPerIpPerSecond = maxConnectsPerIpPerSecond.coerceIn(1, 1000)
         zombieTimeoutMs = zombieTimeoutMs.coerceIn(5_000L, 300_000L)
         serverTimeoutMs = serverTimeoutMs.coerceIn(200L, 300_000L)
+        if (TimeOfDay.parse(timeOfDay) == null) {
+            Log.warn("timeOfDay '$timeOfDay' not recognised (day|night), using day")
+            timeOfDay = "day"
+        }
     }
 
     companion object {

@@ -15,6 +15,7 @@ import com.lanfps.shared.Material
 import com.lanfps.shared.MathUtil
 import com.lanfps.shared.RayMath
 import com.lanfps.shared.Team
+import com.lanfps.shared.TimeOfDay
 import com.lanfps.shared.Vec3
 import com.lanfps.shared.Weapons
 import javax.microedition.khronos.egl.EGLConfig
@@ -36,13 +37,25 @@ import kotlin.math.sin
  * detail layer multiplied by the original palette colour, so the look is a
  * strictly-upgraded version of the old flat one. Each material is its own
  * small mesh + draw call (~8 world draws total), still nothing for a GPU.
- * The sky is an inward-facing cylinder textured with the generated daylight
- * panorama (clear-blue zenith falling to a pale haze band at the horizon,
- * the same colour the world fogs toward), completed in-shader by a sun disc
- * (anchored to the diffuse light direction so shadows and sun agree) and a
- * slowly drifting procedural cloud layer. Shadows come in two cheap layers:
- * a baked contact darkening of floor tiles near static geometry, and
- * per-frame blob quads under every live player that fade with drop height.
+ * The sky is an inward-facing cylinder textured with the generated panorama
+ * (daylight gradient by default; a starfield night panorama ships alongside
+ * for the server-picked night preset — see below), completed in-shader by a
+ * sun disc (anchored to the diffuse light direction so shadows and sun
+ * agree) and a slowly drifting procedural cloud layer. Shadows come in three
+ * cheap layers: baked contact AO of floor tiles near static geometry, baked
+ * SUN shadows (a ray from every floor tile toward the sun, AABB-tested and
+ * blurred across tiles), and per-frame blob quads under live players that
+ * stretch along the sun azimuth and fade with drop height.
+ *
+ * The lit shader carries a Blinn sun-specular (per-material strength) and a
+ * dynamic point-light hook fed by muzzle flashes and grenade blasts, so
+ * gunfire briefly lights up nearby walls. Static neon trim ridges cap the
+ * tall walls and pillars. A depth-tested sun flare billboard (+ two ghosts)
+ * rides the additive effects batch.
+ *
+ * P8: the SERVER picks the lighting preset (timeOfDay=day|night). The client
+ * hot-swaps sky texture, fog, ambient, cloud/sun tints and the PostFx
+ * grading constants when the value in [ClientGameState.timeOfDay] changes.
  *
  * On top of that sits the post chain ([PostFx]): the whole scene renders into
  * an MSAA off-screen buffer, bright pixels are blurred into a bloom halo and
@@ -92,6 +105,8 @@ class GameRenderer(
     private val padMesh = Mesh(hasNormals = true)
     private val pickupCube = Mesh(hasNormals = true)
     private val grenodeMesh = Mesh(hasNormals = true)
+    /** P8-6: static neon trim ridges capping tall walls and pillars. */
+    private val trimMesh = Mesh(hasNormals = true)
     private val prevGrenades = HashMap<Int, FloatArray>(8)
     private var pickupYaw = 0f
     // The avatar split so legs can swing while the upper body leans: body mesh
@@ -103,7 +118,9 @@ class GameRenderer(
     // The sky needs UVs but not normals; the lit layout is the only one with
     // UVs, so it piggy-backs on it (a handful of unused floats per vertex).
     private val skyMesh = Mesh(hasNormals = true, drawMode = GLES30.GL_TRIANGLES)
-    private val effectMesh = DynamicMesh(hasNormals = false, maxVertices = 6 * 64)
+    // P8-7: bumped +96 verts so the sun-flare fans always fit beside a full
+    // tracer burst (DynamicMesh silently drops overflow).
+    private val effectMesh = DynamicMesh(hasNormals = false, maxVertices = 6 * 80)
     // Contact shadows under players: rebuilt every frame, one alpha-blended
     // batch. Uses the lit layout purely because that is the one that carries
     // UVs (same trick as the sky mesh).
@@ -114,8 +131,35 @@ class GameRenderer(
     private val materialTex = HashMap<Int, Int>(6)
     private var playerTex = 0
     private var weaponTex = 0
-    private var skyTex = 0
+    private var skyTexDay = 0
+    private var skyTexNight = 0
     private var whiteTex = 0
+
+    // ---- P8 lighting presets (day default; server can pick night) ----------
+    /** Which preset the uniforms currently hold. */
+    private var presetNight = false
+    private var fogR = 0.780f
+    private var fogG = 0.845f
+    private var fogB = 0.930f
+    private var fogDensityPlay = 0.0075f
+    private var fogDensityMenu = 0.0045f
+    private var ambientLight = 0.66f
+    private var trimEmissive = 0.30f
+    /** Night scenes let gunfire light the world harder — contrast sells it. */
+    private var pointGainScale = 1.0f
+    private var sunTintR = 1.0f
+    private var sunTintG = 0.96f
+    private var sunTintB = 0.88f
+    private var sunGain = 1.0f
+    private var cloudR = 0.93f
+    private var cloudG = 0.95f
+    private var cloudB = 1.00f
+
+    // ---- P8-3 dynamic point light (muzzle flash / grenade blast) -----------
+    private var blastFromMs = Long.MIN_VALUE
+    private var blastX = 0f
+    private var blastY = 0f
+    private var blastZ = 0f
 
     // ---- particles ----------------------------------------------------------
     // One additive batch for sparks, death shards, foot dust and ambient motes.
@@ -162,6 +206,9 @@ class GameRenderer(
     // single-threaded, so two reusable Vec3s are plenty.
     private val shadowRay = Vec3()
     private val shadowDir = Vec3(0f, -1f, 0f)
+    /** Scratch for the P8-1 baked sun-shadow rays (build-time only). */
+    private val sunRay = Vec3()
+    private val sunDirVec = Vec3()
     private var weaponKick = 0f
     private var frameCount = 0
     private var fpsAccum = 0f
@@ -194,7 +241,7 @@ class GameRenderer(
         GLES30.glEnable(GLES30.GL_CULL_FACE)
         GLES30.glCullFace(GLES30.GL_BACK)
         GLES30.glFrontFace(GLES30.GL_CCW)
-        GLES30.glClearColor(FOG_R, FOG_G, FOG_B, 1f)
+        GLES30.glClearColor(fogR, fogG, fogB, 1f)
         GLES30.glDisable(GLES30.GL_BLEND)
 
         lastFrameNanos = System.nanoTime()
@@ -223,7 +270,10 @@ class GameRenderer(
         materialTex[Material.RAMP] = textureLoader.load("ramp.png")
         playerTex = textureLoader.load("player.png")
         weaponTex = textureLoader.load("weapon.png")
-        skyTex = textureLoader.load("sky.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
+        // P8: day is the default; the night panorama ships alongside for the
+        // server-picked night preset (both are tiny generated panoramas).
+        skyTexDay = textureLoader.load("sky.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
+        skyTexNight = textureLoader.load("sky_night.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
     }
 
     private fun texGain(material: Int): Float = when (material) {
@@ -318,6 +368,37 @@ class GameRenderer(
         AndroidLog.i("sky mesh: ${skyMesh.vertexCount} verts")
     }
 
+    /**
+     * P8: hot-swap between the day and night lighting presets. Touches only
+     * uniform-level state (fog/ambient/sun/cloud tints, trim glow, grading
+     * constants) — meshes and their baked albedos/AO stay shared, which is
+     * exactly why the swap costs nothing per vertex.
+     */
+    private fun applyLightPreset(night: Boolean) {
+        if (night) {
+            fogR = 0.045f; fogG = 0.062f; fogB = 0.085f
+            fogDensityPlay = 0.0090f; fogDensityMenu = 0.0055f
+            ambientLight = 0.22f
+            trimEmissive = 0.55f
+            pointGainScale = 1.6f
+            sunTintR = 0.72f; sunTintG = 0.82f; sunTintB = 1.05f
+            sunGain = 0.5f
+            cloudR = 0.085f; cloudG = 0.115f; cloudB = 0.170f
+        } else {
+            fogR = 0.780f; fogG = 0.845f; fogB = 0.930f
+            fogDensityPlay = 0.0075f; fogDensityMenu = 0.0045f
+            ambientLight = 0.66f
+            trimEmissive = 0.30f
+            pointGainScale = 1.0f
+            sunTintR = 1.0f; sunTintG = 0.96f; sunTintB = 0.88f
+            sunGain = 1.0f
+            cloudR = 0.93f; cloudG = 0.95f; cloudB = 1.0f
+        }
+        postFx.applyPreset(night)
+        GLES30.glClearColor(fogR, fogG, fogB, 1f)
+        AndroidLog.i("lighting preset -> ${if (night) "NIGHT" else "DAY"}")
+    }
+
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         GLES30.glViewport(0, 0, width, height)
         camera.setPerspective(width, height)
@@ -375,6 +456,14 @@ class GameRenderer(
         val nowMs = System.currentTimeMillis()
         state.snapshots.sampleInto(renderEntities, entityPool, nowMs)
 
+        // P8: the server can flip the lighting preset at any time (lobby
+        // broadcast) — catch the change here, on the GL thread.
+        val wantNight = state.timeOfDay == TimeOfDay.NIGHT
+        if (wantNight != presetNight) {
+            presetNight = wantNight
+            applyLightPreset(wantNight)
+        }
+
         if (playing) updateGameCamera(dt) else updateMenuCamera(dt)
         // P2-5: while dead, the camera borrows the killer's eyes.
         if (playing && !state.alive) applySpectatorCamera()
@@ -389,9 +478,12 @@ class GameRenderer(
         sky.setSampler("uTex", 0)
         sky.setVec3("uEye", camera.x, camera.y, camera.z)
         sky.setVec3("uSunDir", LIGHT_X, LIGHT_Y, LIGHT_Z)
+        sky.setVec3("uSunTint", sunTintR, sunTintG, sunTintB)
+        sky.setFloat("uSunGain", sunGain)
+        sky.setVec3("uCloudCol", cloudR, cloudG, cloudB)
         sky.setFloat("uTime", timeSec)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, skyTex)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (presetNight) skyTexNight else skyTexDay)
         GLES30.glDepthMask(false)
         skyMesh.draw()
         GLES30.glDepthMask(true)
@@ -400,34 +492,44 @@ class GameRenderer(
         lit.use()
         lit.setMatrix("uViewProj", camera.viewProjection)
         lit.setVec3("uLightDir", LIGHT_X, LIGHT_Y, LIGHT_Z)
-        lit.setVec3("uFogColor", FOG_R, FOG_G, FOG_B)
-        lit.setFloat("uFogDensity", if (playing) 0.0075f else 0.0045f)
+        lit.setVec3("uFogColor", fogR, fogG, fogB)
+        lit.setFloat("uFogDensity", if (playing) fogDensityPlay else fogDensityMenu)
         lit.setVec3("uEye", camera.x, camera.y, camera.z)
         // Midday scattering: the hemisphere term carries most of the light,
-        // the directional sun adds contrast on the lit faces.
-        lit.setFloat("uAmbient", 0.66f)
-        lit.setFloat("uTime", timeSec)
+        // the directional sun adds contrast on the lit faces. (Night preset
+        // drops this hard — same albedos then read as moonlit.)
+        lit.setFloat("uAmbient", ambientLight)
         lit.setSampler("uTex", 0)
         lit.setMatrix("uModel", identity)
         lit.setVec3("uTint", 1f, 1f, 1f)
+        updatePointLight(lit, nowMs, playing)
 
         for ((material, mesh) in materialMeshes) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, materialTex[material] ?: whiteTex)
             lit.setFloat("uTexGain", texGain(material))
-            // The floor gets the slow scanning shimmer; walls keep still.
-            lit.setFloat("uSweep", if (material == Material.FLOOR) 1.0f else 0.0f)
+            lit.setFloat("uSpec", specFor(material))
             lit.setFloat("uEmissive", 0.0f)
             mesh.draw()
         }
 
         // Spawn strips bind the white 1x1: detail layer = 1.0, pure palette.
-        // A gentle breathing glow on top — the marker that says "safe room".
+        // P8: static glow (the pulsing "breathing" read as light waves).
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
-        lit.setFloat("uSweep", 0.0f)
-        lit.setFloat("uEmissive", 0.16f + 0.10f * sin(timeSec * 2.4f).coerceAtLeast(0f))
+        lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uEmissive", 0.22f)
         spawnMesh.draw()
-        lit.setFloat("uEmissive", 0.0f)
+
+        // P8-6: static neon trim ridges on tall walls/pillars. Constant glow
+        // (no pulsing): bright cyan by day, a neon skyline by night.
+        if (trimMesh.vertexCount > 0) {
+            lit.setFloat("uSpec", 0.0f)
+            lit.setFloat("uEmissive", trimEmissive)
+            trimMesh.draw()
+            lit.setFloat("uEmissive", 0.0f)
+        } else {
+            lit.setFloat("uEmissive", 0.0f)
+        }
 
         // P4 content trio, drawn only while we're actually in a match world:
         // powered pads with a breathing pulse, spinning pickup cubes and the
@@ -437,11 +539,13 @@ class GameRenderer(
             lit.setFloat("uTexGain", 1.0f)
             lit.setVec3("uTint", 1f, 1f, 1f)
 
-            // Pads: static ring, breathing emissive like the spawn strips.
+            // Pads: static ring, constant powered glow (no pulse waves).
             if (padMesh.vertexCount > 0) {
-                lit.setFloat("uEmissive", 0.30f + 0.22f * sin(timeSec * 3.1f).coerceAtLeast(0f))
+                lit.setFloat("uSpec", 0.25f)
+                lit.setFloat("uEmissive", 0.42f)
                 padMesh.draw()
                 lit.setFloat("uEmissive", 0.0f)
+                lit.setFloat("uSpec", 0.0f)
             }
 
             drawPickups(lit, playing, dt)
@@ -671,15 +775,25 @@ class GameRenderer(
             val alpha = 0.40f * fade + 0.07f
             val radius = 0.55f + drop * 0.055f
 
+            // P8-5: ellipse stretched along the sun azimuth — a standing body
+            // throws an oblong shadow away from the sun, not a coin. The fan
+            // centre is nudged the same way so the feet sit inside the shadow.
+            val ecx = cx + SHADOW_DIR_X * 0.10f
+            val ecz = cz + SHADOW_DIR_Z * 0.10f
+            val rAlong = radius * 1.22f
+            val rAcross = radius * 0.88f
+
             // Radial fan as triangle soup: centre vertex opaque-ish, rim zero —
             // the interpolator does the soft falloff.
-            var prevX = cx + radius
-            var prevZ = cz
+            var prevX = ecx + SHADOW_PERP_X * rAcross
+            var prevZ = ecz + SHADOW_PERP_Z * rAcross
             for (k in 1..SHADOW_SEGMENTS) {
                 val a = (k * Math.PI * 2 / SHADOW_SEGMENTS).toFloat()
-                val nx = cx + cos(a) * radius
-                val nz = cz + sin(a) * radius
-                shadowBuilder.vertex(cx, floorY, cz, 0f, 1f, 0f, alpha, 0f, 0f)
+                val cA = cos(a) * rAcross
+                val sA = sin(a) * rAlong
+                val nx = ecx + SHADOW_PERP_X * cA + SHADOW_DIR_X * sA
+                val nz = ecz + SHADOW_PERP_Z * cA + SHADOW_DIR_Z * sA
+                shadowBuilder.vertex(ecx, floorY, ecz, 0f, 1f, 0f, alpha, 0f, 0f)
                 shadowBuilder.vertex(prevX, floorY, prevZ, 0f, 1f, 0f, 0f, 0f, 0f)
                 shadowBuilder.vertex(nx, floorY, nz, 0f, 1f, 0f, 0f, 0f, 0f)
                 prevX = nx
@@ -770,13 +884,14 @@ class GameRenderer(
         pickupYaw += dt * 70f
 
         lit.setMatrix("uModel", identity)
+        lit.setFloat("uSpec", 0.35f)
         var any = false
         for (p in pickups) {
             if (!p.active) continue
             any = true
             val (r, g, b) = pickupTint(p.kind)
             lit.setVec3("uTint", r, g, b)
-            lit.setFloat("uEmissive", 0.48f + 0.16f * sin(timeSec * 3.6f + p.x).toFloat())
+            lit.setFloat("uEmissive", 0.52f)
 
             val bob = 0.42f + 0.09f * sin(timeSec * 2.1f + p.z).toFloat()
             Matrix.setIdentityM(model, 0)
@@ -787,6 +902,7 @@ class GameRenderer(
         }
         if (any) {
             lit.setFloat("uEmissive", 0.0f)
+            lit.setFloat("uSpec", 0.0f)
             lit.setVec3("uTint", 1f, 1f, 1f)
             lit.setMatrix("uModel", identity)
         }
@@ -813,6 +929,7 @@ class GameRenderer(
         val list = snap?.grenades ?: emptyList<GrenadeState>()
 
         // Fat acorn: dark body; fuse nearing its end blinks a fast hot warn.
+        lit.setFloat("uSpec", 0.1f)
         for (g in list) {
             val blink = g.fuseTicks > 30 && ((nowMs / 90L) and 1L) == 0L
             if (blink) {
@@ -831,6 +948,7 @@ class GameRenderer(
             slot[0] = g.x; slot[1] = g.y; slot[2] = g.z
         }
         lit.setFloat("uEmissive", 0.0f)
+        lit.setFloat("uSpec", 0.0f)
         lit.setVec3("uTint", 1f, 1f, 1f)
         lit.setMatrix("uModel", identity)
 
@@ -844,6 +962,10 @@ class GameRenderer(
                 if (!alive) {
                     iter.remove()
                     particles.explosion(pos[0], pos[1], pos[2])
+                    // P8-3: the blast feeds the dynamic point light for a
+                    // quarter second — nearby walls flash with the boom.
+                    blastFromMs = nowMs
+                    blastX = pos[0]; blastY = pos[1] + 0.25f; blastZ = pos[2]
                     val ddx = pos[0] - camera.x
                     val ddz = pos[2] - camera.z
                     val dist = kotlin.math.sqrt(ddx * ddx + ddz * ddz)
@@ -908,6 +1030,7 @@ class GameRenderer(
 
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, playerTex)
         lit.setFloat("uTexGain", 1.82f)
+        lit.setFloat("uSpec", 0.28f)
 
         // ---- legs -------------------------------------------------------------
         // Swing amplitude grows with speed up to a full run; phase advances with
@@ -1011,10 +1134,63 @@ class GameRenderer(
         // deliberately darker so the small readout dots pop).
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, weaponTex)
         lit.setFloat("uTexGain", 2.22f)
+        lit.setFloat("uSpec", 0.55f)
         weaponMesh.draw()
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
-        lit.setFloat("uFogDensity", 0.0075f)
+        lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uFogDensity", fogDensityPlay)
+    }
+
+    /**
+     * P8-3: one dynamic point light per frame, strongest event wins — the
+     * local muzzle flash, or a grenade blast for its first 240 ms. Set on the
+     * LIT program once per frame; every lit draw (world, players, weapon)
+     * picks it up, which is what makes gunfire light the room.
+     */
+    private fun updatePointLight(lit: ShaderProgram, nowMs: Long, playing: Boolean) {
+        var px = 0f
+        var py = 0f
+        var pz = 0f
+        var gain = 0f
+        var cr = 1.0f
+        var cg = 0.72f
+        var cb = 0.42f
+
+        if (playing && nowMs < state.muzzleFlashUntilMs && state.alive) {
+            px = camera.x + camera.rightX * 0.155f + camera.upX * -0.10f + camera.forwardX * 0.35f
+            py = camera.y + camera.rightY * 0.155f + camera.upY * -0.10f + camera.forwardY * 0.35f
+            pz = camera.z + camera.rightZ * 0.155f + camera.upZ * -0.10f + camera.forwardZ * 0.35f
+            gain = 2.4f
+        }
+
+        val blastAge = (nowMs - blastFromMs).toFloat()
+        if (blastAge in 0f..240f) {
+            val g = 7.0f * (1f - blastAge / 240f)
+            if (g > gain) {
+                gain = g
+                px = blastX; py = blastY; pz = blastZ
+                cr = 1.0f; cg = 0.50f; cb = 0.24f
+            }
+        }
+
+        lit.setVec3("uPtPos", px, py, pz)
+        lit.setVec3("uPtColor", cr, cg, cb)
+        lit.setFloat("uPtGain", gain * pointGainScale)
+    }
+
+    /**
+     * P8-2: Blinn sun-specular strength per material (0 = matte). Concrete
+     * and metal get a sunny glint; wood stays dry.
+     */
+    private fun specFor(material: Int): Float = when (material) {
+        Material.FLOOR -> 0.30f
+        Material.WALL -> 0.20f
+        Material.PILLAR -> 0.30f
+        Material.CRATE -> 0.10f
+        Material.COVER -> 0.16f
+        Material.RAMP -> 0.14f
+        else -> 0.20f
     }
 
     /** Builds camera-facing quads for tracers and the muzzle flash. */
@@ -1086,7 +1262,81 @@ class GameRenderer(
             effectMesh.vertex(mx - rx + ux, my - ry + uy, mz - rz + uz, r, g, b)
         }
 
+        buildSunFlare()
         effectMesh.end()
+    }
+
+    /**
+     * P8-7: sun flare — a soft radial billboard at the far end of the sun ray
+     * plus two ghosts mirrored about the view axis (classic streak flare).
+     * Everything is a triangle-fan "sprite": bright centre vertex, zero rim,
+     * so the additive blend feathers the falloff with no texture. The batch
+     * is depth-tested, so arena walls occlude the flare exactly like the real
+     * sun; it only lives where a slice of sky is visible that way. Fades in
+     * while the look direction approaches the sun azimuth.
+     */
+    private fun buildSunFlare() {
+        val vis = camera.forwardX * SUN_X + camera.forwardY * SUN_Y + camera.forwardZ * SUN_Z
+        if (vis <= FLARE_MIN_VIS) return
+        val t = ((vis - FLARE_MIN_VIS) / (1f - FLARE_MIN_VIS)).coerceIn(0f, 1f)
+        // Dimmer at night (the disc there is a low moon, not the sun).
+        val fade = t * t * (0.35f + 0.65f * sunGain)
+
+        // Main disc: ~2.5 degrees across at the flare's 160 m anchor depth.
+        addFlareFan(
+            camera.x + SUN_X * FLARE_DIST, camera.y + SUN_Y * FLARE_DIST, camera.z + SUN_Z * FLARE_DIST,
+            7.0f,
+            1.0f * 0.55f * fade, 0.92f * 0.55f * fade, 0.75f * 0.55f * fade,
+        )
+
+        // Ghost 1: halfway between the sun and the frame centre, cool blue.
+        val g1x = SUN_X * 0.45f + camera.forwardX * 0.55f
+        val g1y = SUN_Y * 0.45f + camera.forwardY * 0.55f
+        val g1z = SUN_Z * 0.45f + camera.forwardZ * 0.55f
+        val g1l = kotlin.math.sqrt(g1x * g1x + g1y * g1y + g1z * g1z)
+        if (g1l > 1e-4f && (g1x * camera.forwardX + g1y * camera.forwardY + g1z * camera.forwardZ) / g1l > 0.25f) {
+            addFlareFan(
+                camera.x + g1x / g1l * FLARE_DIST, camera.y + g1y / g1l * FLARE_DIST, camera.z + g1z / g1l * FLARE_DIST,
+                2.6f,
+                0.55f * 0.28f * fade, 0.72f * 0.28f * fade, 1.0f * 0.28f * fade,
+            )
+        }
+
+        // Ghost 2: the sun direction mirrored through the view axis, warm.
+        val dot2 = 2f * vis
+        val rx = dot2 * camera.forwardX - SUN_X
+        val ry = dot2 * camera.forwardY - SUN_Y
+        val rz = dot2 * camera.forwardZ - SUN_Z
+        val g2x = rx * 0.6f + camera.forwardX * 0.4f
+        val g2y = ry * 0.6f + camera.forwardY * 0.4f
+        val g2z = rz * 0.6f + camera.forwardZ * 0.4f
+        val g2l = kotlin.math.sqrt(g2x * g2x + g2y * g2y + g2z * g2z)
+        if (g2l > 1e-4f && (g2x * camera.forwardX + g2y * camera.forwardY + g2z * camera.forwardZ) / g2l > 0.25f) {
+            addFlareFan(
+                camera.x + g2x / g2l * FLARE_DIST, camera.y + g2y / g2l * FLARE_DIST, camera.z + g2z / g2l * FLARE_DIST,
+                1.7f,
+                0.95f * 0.20f * fade, 0.70f * 0.20f * fade, 0.45f * 0.20f * fade,
+            )
+        }
+    }
+
+    /** One camera-facing radial fan: bright centre vertex, zero rim. */
+    private fun addFlareFan(cx: Float, cy: Float, cz: Float, radius: Float, r: Float, g: Float, b: Float) {
+        var prevX = cx + camera.rightX * radius
+        var prevY = cy + camera.rightY * radius
+        var prevZ = cz + camera.rightZ * radius
+        for (k in 1..FLARE_SEGMENTS) {
+            val a = (k * Math.PI * 2 / FLARE_SEGMENTS).toFloat()
+            val ca = cos(a); val sa = sin(a)
+            // rim point on the camera plane
+            val nx = cx + camera.rightX * radius * ca + camera.upX * radius * sa
+            val ny = cy + camera.rightY * radius * ca + camera.upY * radius * sa
+            val nz = cz + camera.rightZ * radius * ca + camera.upZ * radius * sa
+            effectMesh.vertex(cx, cy, cz, r, g, b)
+            effectMesh.vertex(prevX, prevY, prevZ, 0f, 0f, 0f)
+            effectMesh.vertex(nx, ny, nz, 0f, 0f, 0f)
+            prevX = nx; prevY = ny; prevZ = nz
+        }
     }
 
     // ------------------------------------------------------------ mesh build
@@ -1122,6 +1372,63 @@ class GameRenderer(
         // shades in a smooth ramp instead of block-wide steps. One texture
         // repeat every 2 metres as before.
         val tile = 2f
+
+        // ---- P8-1: baked sun shadows ---------------------------------------
+        // For every 2 m tile, four corner-jittered rays march from just above
+        // the tile centre toward the sun. A hit on any solid brush (wall,
+        // pillar, crate...) means the tile is in shade; the jitter fraction
+        // gives a 0.5 m penumbra band and two 3x3 blur passes widen it into a
+        // soft edge. Built once per arena — zero per-frame cost, and the
+        // result multiplies the old contact AO so near-wall shading keeps
+        // working inside real sun shadows.
+        val gw = ((arena.maxX - arena.minX) / tile).toInt() + 1
+        val gh = ((arena.maxZ - arena.minZ) / tile).toInt() + 1
+        var sunGrid = FloatArray(gw * gh) { 1f }
+        run {
+            val sunLen = kotlin.math.sqrt(
+                (LIGHT_X * LIGHT_X + LIGHT_Y * LIGHT_Y + LIGHT_Z * LIGHT_Z).toDouble(),
+            ).toFloat()
+            sunDirVec.set(LIGHT_X / sunLen, LIGHT_Y / sunLen, LIGHT_Z / sunLen)
+            var gi = 0
+            var gz = arena.minZ
+            while (gz < arena.maxZ - 0.001f) {
+                var gx = arena.minX
+                while (gx < arena.maxX - 0.001f) {
+                    var blocked = 0
+                    for (j in SUN_JITTER) {
+                        sunRay.set(gx + tile * 0.5f + j[0], 0.06f, gz + tile * 0.5f + j[1])
+                        val d = RayMath.raycastArena(sunRay, sunDirVec, SUN_SHADOW_DIST, arena)
+                        if (d < SUN_SHADOW_DIST - 0.01f) blocked++
+                    }
+                    sunGrid[gi++] = 1f - 0.50f * blocked / SUN_JITTER.size
+                    gx += tile
+                }
+                gz += tile
+            }
+        }
+        repeat(2) {
+            val src = sunGrid
+            val dst = FloatArray(gw * gh)
+            for (iz in 0 until gh) {
+                for (ix in 0 until gw) {
+                    var acc = 0f
+                    var cnt = 0
+                    for (oz in -1..1) {
+                        for (ox in -1..1) {
+                            val xx = ix + ox
+                            val zz = iz + oz
+                            if (xx in 0 until gw && zz in 0 until gh) {
+                                acc += src[zz * gw + xx]
+                                cnt++
+                            }
+                        }
+                    }
+                    dst[iz * gw + ix] = acc / cnt
+                }
+            }
+            sunGrid = dst
+        }
+
         val floorB = builderFor(Material.FLOOR)
         var z = arena.minZ
         while (z < arena.maxZ - 0.001f) {
@@ -1136,9 +1443,12 @@ class GameRenderer(
                 // (sky-tinted) B/G lift applied below.
                 val c = if (dark) 0.340f else 0.420f
                 val sh = floorContactShadow((x + x1) * 0.5f, (z + z1) * 0.5f)
+                val tx = ((x - arena.minX) / tile).toInt().coerceIn(0, gw - 1)
+                val tz = ((z - arena.minZ) / tile).toInt().coerceIn(0, gh - 1)
+                val sh2 = sh * sunGrid[tz * gw + tx]
                 floorB.floorTile(
                     x, z, x1, z1, 0f,
-                    c * sh, c * 1.06f * sh, c * 1.22f * sh,
+                    c * sh2, c * 1.06f * sh2, c * 1.22f * sh2,
                     uvScale = 2f,
                 )
                 x = x1
@@ -1196,13 +1506,33 @@ class GameRenderer(
         spawnMesh.upload(sb.raw(), sb.floatCount)
 
         // P4-4: jump pads — a dodecagon ring of glowing wedge bricks. Static
-        // geometry, bright vertex colours: with the uEmissive pulse hook they
-        // read as powered launch tiles even before bloom sees them.
+        // geometry, bright vertex colours: with the uEmissive hook they read
+        // as powered launch tiles even before bloom sees them.
         val pb = MeshBuilder(withNormals = true, initialCapacity = 4096)
         for (pad in arena.jumpPads) {
             buildPadRing(pb, pad.x, pad.z, pad.radius)
         }
         padMesh.upload(pb.raw(), pb.floatCount)
+
+        // ---- P8-6: neon trim ridges capping tall walls & pillars -----------
+        // A slim cyan ridge floated a hair above every tall solid's top face:
+        // the sci-fi accent that reads as cool metal edging by day and as a
+        // neon skyline in the night preset (uEmissive comes from the preset).
+        val tb = MeshBuilder(withNormals = true, initialCapacity = 2048)
+        for (brush in arena.brushes) {
+            if (!brush.solid) continue
+            if (brush.material != Material.WALL && brush.material != Material.PILLAR) continue
+            val b = brush.box
+            if (b.sizeY < 1.6f) continue
+            if (b.maxX - b.minX < 0.2f || b.maxZ - b.minZ < 0.2f) continue
+            tb.box(
+                b.minX + 0.07f, b.maxY + 0.004f, b.minZ + 0.07f,
+                b.maxX - 0.07f, b.maxY + 0.05f, b.maxZ - 0.07f,
+                0.30f, 0.75f, 0.85f,
+            )
+        }
+        trimMesh.upload(tb.raw(), tb.floatCount)
+
         prevGrenades.clear() // a new map invalidates blast tracking
         AndroidLog.i(
             "arena mesh: ${materialMeshes.values.sumOf { it.vertexCount }} verts " +
@@ -1340,6 +1670,7 @@ class GameRenderer(
         materialMeshes.clear()
         spawnMesh.dispose()
         padMesh.dispose()
+        trimMesh.dispose()
         pickupCube.dispose()
         grenodeMesh.dispose()
         skyMesh.dispose()
@@ -1362,18 +1693,39 @@ class GameRenderer(
         /** Shadows fade to nothing over this drop (m); also clamps raycasts. */
         private const val SHADOW_MAX_DROP = 5.5f
 
-        // Fog / clear colour: daylight horizon haze, (almost) the same pale
-        // blue the sky panorama fades to at its bottom edge (sky.jpg v=1 ≈
-        // rgb 211/226/244) — matched AFTER the PostFx exposure so distant
-        // geometry dissolves into the sky band instead of a grey wall.
-        private const val FOG_R = 0.780f
-        private const val FOG_G = 0.845f
-        private const val FOG_B = 0.930f
-
         // Key light direction (pointing from the surface toward the light).
+        // Kept un-normalized historically; shaders normalize per fragment.
         private const val LIGHT_X = 0.38f
         private const val LIGHT_Y = 0.86f
         private const val LIGHT_Z = 0.34f
+
+        // Normalized sun direction for CPU-side work (flare, blob ellipse).
+        private val SUN_LEN = kotlin.math.sqrt((LIGHT_X * LIGHT_X + LIGHT_Y * LIGHT_Y + LIGHT_Z * LIGHT_Z).toDouble()).toFloat()
+        private val SUN_X = LIGHT_X / SUN_LEN
+        private val SUN_Y = LIGHT_Y / SUN_LEN
+        private val SUN_Z = LIGHT_Z / SUN_LEN
+
+        /** Horizontal direction a cast shadow stretches (away from the sun). */
+        private val SUN_XZ = kotlin.math.sqrt((LIGHT_X * LIGHT_X + LIGHT_Z * LIGHT_Z).toDouble()).toFloat()
+        private val SHADOW_DIR_X = -LIGHT_X / SUN_XZ
+        private val SHADOW_DIR_Z = -LIGHT_Z / SUN_XZ
+        private val SHADOW_PERP_X = -SHADOW_DIR_Z
+        private val SHADOW_PERP_Z = SHADOW_DIR_X
+
+        // P8-7: sun flare billboard anchor distance / edge fade / fan detail.
+        private const val FLARE_DIST = 160f
+        private const val FLARE_MIN_VIS = 0.90f
+        private const val FLARE_SEGMENTS = 10
+
+        // P8-1: baked sun shadows — ray length (covers 4–5 m walls at the 59°
+        // sun elevation) and the 0.45 m corner jitter that makes the penumbra.
+        private const val SUN_SHADOW_DIST = 9f
+        private val SUN_JITTER = arrayOf(
+            floatArrayOf(0.45f, 0.45f),
+            floatArrayOf(0.45f, -0.45f),
+            floatArrayOf(-0.45f, 0.45f),
+            floatArrayOf(-0.45f, -0.45f),
+        )
 
         private const val LIT_VS = """#version 300 es
             uniform mat4 uViewProj;
@@ -1406,12 +1758,14 @@ class GameRenderer(
             uniform vec3  uEye;
             uniform sampler2D uTex;
             uniform float uTexGain;
-            uniform float uTime;
-            // Sweep amplitude of the scanning shimmer running along the floor
-            // (1 on floor tiles, 0 on every other material's draw).
-            uniform float uSweep;
-            // Pure additive glow in vertex-colour space (spawn strip breathing).
+            // Pure additive glow in vertex-colour space (spawn strips, trim).
             uniform float uEmissive;
+            // P8-2: Blinn specular strength toward the sun (0 = matte).
+            uniform float uSpec;
+            // P8-3: one dynamic point light (muzzle flash / grenade blast).
+            uniform vec3  uPtPos;
+            uniform vec3  uPtColor;
+            uniform float uPtGain;
             in vec3 vNormal;
             in vec3 vColor;
             in vec3 vWorld;
@@ -1419,7 +1773,8 @@ class GameRenderer(
             out vec4 fragColor;
             void main() {
                 vec3 n = normalize(vNormal);
-                float lambert = max(dot(n, normalize(uLightDir)), 0.0);
+                vec3 ld = normalize(uLightDir);
+                float lambert = max(dot(n, ld), 0.0);
                 // Hemisphere term: sky above, bounce below. The daylight base
                 // is high (the whole dome is a light source), so vertical
                 // walls stay readable without a second light or shadow maps.
@@ -1430,15 +1785,26 @@ class GameRenderer(
                 // colours survive texturing and a white 1x1 fallback texture is
                 // a silent no-op returning the pre-texture look.
                 vec3 detail = texture(uTex, vUv).rgb * uTexGain;
-                vec3 c = vColor * detail * uTint * light;
-                // A scanner shimmer sweeping diagonally across the arena floor:
-                // one cool band roughly 12 m wide, reappearing every ~8 s.
-                // Kept gentle so the sunlit checker reads it as a neon accent,
-                // not as a lighting change.
-                if (uSweep > 0.0) {
-                    float wave = sin(vWorld.x * 0.42 + vWorld.z * 0.31 - uTime * 1.35);
-                    float band = smoothstep(0.72, 0.96, wave) * uSweep;
-                    c += vec3(0.04, 0.085, 0.14) * band * (0.4 + 0.6 * detail.g);
+                vec3 surf = vColor * detail * uTint;
+                vec3 c = surf * light;
+                // P8-3: the gunfire/boom light. Quadratic-ish rolloff over
+                // ~14 m keeps it a local event, never a second sun.
+                if (uPtGain > 0.0) {
+                    vec3 dv = uPtPos - vWorld;
+                    float d = length(dv);
+                    float att = clamp(1.0 - d / 14.0, 0.0, 1.0);
+                    att *= att;
+                    float ndl = max(dot(n, dv / max(d, 0.001)), 0.0);
+                    c += surf * uPtColor * (att * ndl * uPtGain);
+                }
+                // P8-2: Blinn glint toward the sun, gated by lambert so only
+                // the sun-facing sides sparkle. It is what makes the concrete
+                // read as sunlit when the camera moves.
+                if (uSpec > 0.0) {
+                    vec3 v = normalize(uEye - vWorld);
+                    vec3 h = normalize(v + ld);
+                    float spec = pow(max(dot(n, h), 0.0), 48.0) * uSpec;
+                    c += vec3(1.0, 0.98, 0.92) * spec * (0.25 + 0.75 * lambert);
                 }
                 if (uEmissive > 0.0) {
                     c += vColor * uEmissive;
@@ -1491,6 +1857,9 @@ class GameRenderer(
             precision mediump float;
             uniform sampler2D uTex;
             uniform vec3  uSunDir;
+            uniform vec3  uSunTint;   // preset: warm white by day, cool moon by night
+            uniform float uSunGain;   // preset: 1 day / 0.5 night
+            uniform vec3  uCloudCol;  // preset: white cumulus / dark stratus
             uniform float uTime;
             in vec2 vUv;
             in vec3 vDir;
@@ -1537,10 +1906,10 @@ class GameRenderer(
                     // 0.50 looked fine on dark clouds; on white ones it
                     // whitens the entire sky.)
                     cloud = smoothstep(0.60, 0.85, n) * band;
-                    // White midday body that warms up toward the sun side —
-                    // the silver-lining rim that sells a lit cloud.
-                    float sunSide = pow(max(sunDot, 0.0), 3.0);
-                    vec3 cloudCol = vec3(0.93, 0.95, 1.00)
+                    // Cloud body from the active preset, warming toward the
+                    // sun side — the silver-lining rim that sells a lit cloud.
+                    float sunSide = pow(max(sunDot, 0.0), 3.0) * uSunGain;
+                    vec3 cloudCol = uCloudCol
                                   + vec3(0.12, 0.06, -0.06) * sunSide;
                     // Slight grey-blue underside keeps the puffs 3D against
                     // the pale horizon band.
@@ -1553,10 +1922,9 @@ class GameRenderer(
                 float disc   = smoothstep(0.99935, 0.99978, sunDot);
                 float corona = pow(max(sunDot, 0.0), 340.0) * 1.05;
                 float halo   = pow(max(sunDot, 0.0), 14.0) * 0.26;
-                // White-hot core with a wide warm daylight glare — the extra
-                // halo range is what makes the sky read as outdoors.
-                vec3 sunCol = vec3(1.00, 0.96, 0.88);
-                vec3 sun = sunCol * (disc * 3.6 + corona + halo);
+                // White-hot core with a wide daylight glare; the preset's
+                // uSunGain dims the whole term into a soft moon at night.
+                vec3 sun = uSunTint * uSunGain * (disc * 3.6 + corona + halo);
                 col += sun * (1.0 - cloud * 0.60);
 
                 fragColor = vec4(col, 1.0);
