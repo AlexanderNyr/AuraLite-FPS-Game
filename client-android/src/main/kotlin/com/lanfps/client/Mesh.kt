@@ -161,3 +161,64 @@ class DynamicMesh(
         head = 0
     }
 }
+
+/**
+ * P10: dynamic mesh for the soft-smoke system. Interleaved
+ * pos(3)/color(3)/alpha(1)/uv(2) = 9 floats per vertex; rewritten every frame
+ * with GL_STREAM_DRAW exactly like [DynamicMesh].
+ */
+class SpriteMesh(private val maxVertices: Int) : Mesh(hasNormals = false) {
+    private val cpu = FloatArray(maxVertices * SmokeSystem.FLOATS_PER_VERTEX)
+    private var allocated = false
+    private var head = 0
+
+    /** Rewrites the VBO from an external scratch — zero per-frame allocation. */
+    fun uploadDynamic(src: FloatArray, floatCount: Int) {
+        ensureCreated()
+        head = floatCount
+        vertexCount = floatCount / SmokeSystem.FLOATS_PER_VERTEX
+        GLES30.glBindVertexArray(vao[0])
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, vbo[0])
+        if (!allocated) {
+            GLES30.glBufferData(
+                GLES30.GL_ARRAY_BUFFER,
+                cpu.size * GlUtil.FLOAT_BYTES, null, GLES30.GL_STREAM_DRAW,
+            )
+            val stride = SmokeSystem.FLOATS_PER_VERTEX * GlUtil.FLOAT_BYTES
+            GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_POSITION)
+            GLES30.glVertexAttribPointer(
+                ShaderProgram.ATTRIB_POSITION, 3, GLES30.GL_FLOAT, false, stride, 0,
+            )
+            GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_COLOR)
+            GLES30.glVertexAttribPointer(
+                ShaderProgram.ATTRIB_COLOR, 3, GLES30.GL_FLOAT, false, stride,
+                3 * GlUtil.FLOAT_BYTES,
+            )
+            GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_ALPHA)
+            GLES30.glVertexAttribPointer(
+                ShaderProgram.ATTRIB_ALPHA, 1, GLES30.GL_FLOAT, false, stride,
+                6 * GlUtil.FLOAT_BYTES,
+            )
+            GLES30.glEnableVertexAttribArray(ShaderProgram.ATTRIB_UV)
+            GLES30.glVertexAttribPointer(
+                ShaderProgram.ATTRIB_UV, 2, GLES30.GL_FLOAT, false, stride,
+                7 * GlUtil.FLOAT_BYTES,
+            )
+            allocated = true
+        }
+        if (head > 0) {
+            GLES30.glBufferSubData(
+                GLES30.GL_ARRAY_BUFFER, 0, head * GlUtil.FLOAT_BYTES,
+                GlUtil.floatBuffer(src, head),
+            )
+        }
+        GLES30.glBindVertexArray(0)
+        GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+    }
+
+    override fun dispose() {
+        super.dispose()
+        allocated = false
+        head = 0
+    }
+}

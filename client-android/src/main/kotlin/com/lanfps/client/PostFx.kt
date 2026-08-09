@@ -4,9 +4,14 @@ import android.opengl.GLES30
 
 /**
  * Post-processing pipeline: the scene renders off-screen and is then drawn
- * back to the display framebuffer through bright-pass bloom, a soft filmic
- * tonemap, gentle split-tone grading (cool shadows / warm highlights) and a
- * vignette. One long-lived object, zero per-frame allocation.
+ * back to the display framebuffer through bright-pass bloom, screen-space
+ * sun rays (P10-5), a soft filmic tonemap, gentle split-tone grading (cool
+ * shadows / warm highlights) and a vignette. One long-lived object, zero
+ * per-frame allocation.
+ *
+ * P10-7 adds [resolveSoftDepth]: mid-scene the renderer can snapshot the
+ * current scene depth into a texture, letting the smoke pass do per-pixel
+ * soft-particle distance fades while the scene keeps rendering to its FBO.
  *
  * Frame flow when [ready]:
  *   1. [beginScene] binds the multisampled scene FBO — all normal draw calls
@@ -83,6 +88,28 @@ class PostFx {
     private var brightProgram: ShaderProgram? = null
     private var blurProgram: ShaderProgram? = null
     private var composeProgram: ShaderProgram? = null
+    private var raysProgram: ShaderProgram? = null
+
+    // ---- P10-7 soft-particle depth snapshot ---------------------------------
+    private var softDepthFbo = 0
+    private var softDepthTex = 0
+
+    // ---- P10-5 screen-space sun rays ----------------------------------------
+    private var raySunX = 0.5f
+    private var raySunY = 0.5f
+    private var rayGain = 0f
+
+    /** Renderer feeds the sun's screen-space position once per scene. */
+    fun setSunRay(uvX: Float, uvY: Float, gain: Float) {
+        raySunX = uvX; raySunY = uvY; rayGain = gain
+    }
+
+    /** Depth texture from the last [resolveSoftDepth] call (0 when absent). */
+    fun softDepthTexture(): Int = softDepthTex
+
+    /** Scene dimensions (needed by the smoke shader for screen uvs). */
+    fun sceneWidth(): Int = width
+    fun sceneHeight(): Int = height
 
     /** Scratch int buffers reused across calls — the renderer is single-threaded. */
     private val tmp1 = IntArray(1)
@@ -108,7 +135,9 @@ class PostFx {
             brightProgram = ShaderProgram("bright", FULLSCREEN_VS, BRIGHT_FS)
             blurProgram = ShaderProgram("blur", FULLSCREEN_VS, BLUR_FS)
             composeProgram = ShaderProgram("compose", FULLSCREEN_VS, COMPOSE_FS)
+            raysProgram = ShaderProgram("rays", FULLSCREEN_VS, RAYS_FS)
             createTargets()
+            createSoftDepth()
             GLES30.glGenVertexArrays(1, tmp1, 0)
             emptyVao = tmp1[0]
         } catch (t: Throwable) {
@@ -193,6 +222,23 @@ class PostFx {
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexA)
         drawTriangle()
 
+        // 3.5) P10-5: screen-space sun rays. 24 decays taps towards the sun
+        // uv; the source is the bright-blurred chain, so rays automatically
+        // die when geometry occludes the sun disc (no disc -> nothing bright
+        // to smear). Writes into bloomTexA; composite samples that.
+        var bloomOut = bloomTexB
+        val rays = raysProgram
+        if (rays != null && rayGain > 0.004f) {
+            bindFboViewport(bloomFboA, bloomW, bloomH)
+            rays.use()
+            rays.setSampler("uTex", 0)
+            rays.setVec2("uSunUv", raySunX, raySunY)
+            rays.setFloat("uGain", rayGain)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexB)
+            drawTriangle()
+            bloomOut = bloomTexA
+        }
+
         // 4) composite to the screen: scene + bloom, graded
         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
         GLES30.glViewport(0, 0, width, height)
@@ -203,7 +249,7 @@ class PostFx {
         compose.setFloat("uBloomStrength", BLOOM_STRENGTH)
         compose.setFloat("uVignette", vignette)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexB)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomOut)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sceneTex)
         drawTriangle()
@@ -329,6 +375,61 @@ class PostFx {
         return rb
     }
 
+    /**
+     * P10-7: depth-only FBO + texture used as the soft-particle compare
+     * source. Identical in size to the scene; depth-only targets are legal in
+     * GLES3 when draw/read buffers are explicitly NONE.
+     */
+    private fun createSoftDepth() {
+        GLES30.glGenTextures(1, tmp1, 0)
+        softDepthTex = tmp1[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, softDepthTex)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D, 0, GLES30.GL_DEPTH_COMPONENT16,
+            width, height, 0, GLES30.GL_DEPTH_COMPONENT, GLES30.GL_UNSIGNED_SHORT,
+            null,
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glGenFramebuffers(1, tmp1, 0)
+        softDepthFbo = tmp1[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, softDepthFbo)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER, GLES30.GL_DEPTH_ATTACHMENT,
+            GLES30.GL_TEXTURE_2D, softDepthTex, 0,
+        )
+        GLES30.glDrawBuffers(1, intArrayOf(GLES30.GL_NONE), 0)
+        GLES30.glReadBuffer(GLES30.GL_NONE)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    /**
+     * P10-7: snapshots current scene depth into [softDepthTex] MID-SCENE.
+     * Called by the renderer between the opaque pass and the transparent
+     * smoke pass; restores the scene frame binding + viewport afterwards so
+     * the outer draw sequence continues untouched.
+     */
+    fun resolveSoftDepth() {
+        if (!ready || softDepthFbo == 0) return
+        GLES30.glBindFramebuffer(
+            GLES30.GL_READ_FRAMEBUFFER,
+            if (samples > 0) msaaFbo else sceneFbo,
+        )
+        GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, softDepthFbo)
+        GLES30.glBlitFramebuffer(
+            0, 0, width, height, 0, 0, width, height,
+            GLES30.GL_DEPTH_BUFFER_BIT, GLES30.GL_NEAREST,
+        )
+        // back to the scene target the renderer left us in
+        GLES30.glBindFramebuffer(
+            GLES30.GL_FRAMEBUFFER,
+            if (samples > 0) msaaFbo else sceneFbo,
+        )
+        GLES30.glViewport(0, 0, width, height)
+    }
+
     /** Deletes every GL object owned by the pipeline. GL thread only. */
     fun dispose() {
         ready = false
@@ -347,6 +448,15 @@ class PostFx {
             GLES30.glDeleteRenderbuffers(3, rbs, 0)
             msaaColorRb = 0; msaaDepthRb = 0; sceneDepthRb = 0
         }
+        if (softDepthFbo != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(softDepthFbo), 0)
+            softDepthFbo = 0
+        }
+        if (softDepthTex != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(softDepthTex), 0)
+            softDepthTex = 0
+        }
+        raysProgram?.dispose(); raysProgram = null
         if (emptyVao != 0) {
             val vaos = intArrayOf(emptyVao)
             GLES30.glDeleteVertexArrays(1, vaos, 0)
@@ -388,6 +498,34 @@ class PostFx {
                 float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
                 float w = smoothstep(uThreshold, uThreshold * (1.0 + uKnee), lum);
                 fragColor = vec4(c * w, 1.0);
+            }
+        """
+
+        /**
+         * P10-5: screen-space god rays — 24 exponentially decayed taps from
+         * the pixel towards the sun's screen position, over the bright-blur
+         * chain. Rays die automatically where walls cover the disc: covered
+         * sun = nothing above the bloom threshold = nothing to elongate.
+         */
+        private const val RAYS_FS = """#version 300 es
+            precision mediump float;
+            in vec2 vUv;
+            uniform sampler2D uTex;
+            uniform vec2 uSunUv;
+            uniform float uGain;
+            out vec4 fragColor;
+            void main() {
+                vec3 c = texture(uTex, vUv).rgb;
+                vec2 dir = (uSunUv - vUv) * 0.93 / 24.0;
+                vec2 uv = vUv;
+                float w = 0.42;
+                vec3 acc = vec3(0.0);
+                for (int i = 0; i < 24; i++) {
+                    uv += dir;
+                    acc += texture(uTex, uv).rgb * w;
+                    w *= 0.93;
+                }
+                fragColor = vec4(c + acc * uGain, 1.0);
             }
         """
 

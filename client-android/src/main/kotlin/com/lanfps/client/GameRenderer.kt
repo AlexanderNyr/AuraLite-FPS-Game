@@ -107,6 +107,31 @@ class GameRenderer(
     private val grenodeMesh = Mesh(hasNormals = true)
     /** P8-6: static neon trim ridges capping tall walls and pillars. */
     private val trimMesh = Mesh(hasNormals = true)
+
+    // ---- P10: CS2-class features -------------------------------------------
+    /** P10-1: sun shadow map (own depth FBO + static light volume). */
+    private val shadowMap = ShadowMap()
+    /** P10-7: smoke pool + its dynamic sprite mesh + shader. */
+    private val smoke = SmokeSystem()
+    private val smokeMesh = SpriteMesh(SmokeSystem.MAX * SmokeSystem.VERTS_PER_SPRITE)
+    private val smokeScratch = FloatArray(SmokeSystem.MAX * SmokeSystem.FLOATS_PER_SPRITE)
+    private var smokeShader: ShaderProgram? = null
+    /** P10-3: per-material bump (height) textures for derivative normal maps. */
+    private val bumpTex = HashMap<Int, Int>(6)
+    /** P10-2 gun-feel lagged camera angles / landing dip / strafe lean. */
+    private var vmYawLag = 0f
+    private var vmPitchLag = 0f
+    private var vmSwayYaw = 0f
+    private var vmSwayPitch = 0f
+    private var vmInit = false
+    private var landDip = 0f
+    private var strafeLean = 0f
+    private var prevEyeX = 0f
+    private var prevEyeY = 0f
+    private var prevEyeZ = 0f
+    private var prevOnGround = true
+    private val sunWorldS = FloatArray(4)
+    private val sunClipS = FloatArray(4)
     private val prevGrenades = HashMap<Int, FloatArray>(8)
     private var pickupYaw = 0f
     // The avatar split so legs can swing while the upper body leans: body mesh
@@ -192,6 +217,7 @@ class GameRenderer(
     /** Second scratch matrix for the per-leg transforms in drawPlayer. */
     private val legModel = FloatArray(16)
     private val scratch = FloatArray(16)
+    private val scratch2 = FloatArray(16)
     private val identity = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
 
     // ---- frame state -------------------------------------------------------
@@ -210,6 +236,43 @@ class GameRenderer(
     /** Scratch for the P8-1 baked sun-shadow rays (build-time only). */
     private val sunRay = Vec3()
     private val sunDirVec = Vec3()
+    /** Scratch for the P10-8 baked corner-AO probes (build-time only). */
+    private val giRay = Vec3()
+    private val giDir = Vec3()
+
+    /**
+     * P10-8: corner-darkening factor baked into subdivided wall faces. Four
+     * short probes tilted outward along the face plane measure "openness" in
+     * a 1.5 m pocket; where walls meet pillars/covers/other walls the factor
+     * presses toward 0.58 while free-standing faces stay at 1.0. Horizontal
+     * faces are already handled by the hemisphere term → return unchanged.
+     */
+    private val wallGi: (Float, Float, Float, Float, Float, Float) -> Float = { x, y, z, nx, ny, nz ->
+        if (ny > 0.99f || ny < -0.99f) {
+            1f
+        } else {
+            // Vertical face: in-plane axes are the horizontal perpendicular
+            // t1=(nz,0,-nx) and up (0,±1,0).
+            var acc = 0f
+            var cnt = 0
+            val dirs = floatArrayOf(
+                nz, 0f, -nx, -nz, 0f, nx,
+                0f, 1f, 0f, 0f, -1f, 0f,
+            )
+            var di = 0
+            while (di < 12) {
+                val ox = dirs[di]; val oy = dirs[di + 1]; val oz = dirs[di + 2]
+                giDir.set(nx * 0.45f + ox * 0.75f, oy * 0.75f, nz * 0.45f + oz * 0.75f)
+                giDir.normalize() // ray distances must be real metres
+                giRay.set(x + nx * 0.03f, y, z + nz * 0.03f)
+                val dm = RayMath.raycastArena(giRay, giDir, 1.5f, arena)
+                acc += (dm / 1.5f).coerceAtMost(1f)
+                cnt++
+                di += 3
+            }
+            0.58f + 0.42f * (acc / cnt)
+        }
+    }
     private var weaponKick = 0f
     private var frameCount = 0
     private var fpsAccum = 0f
@@ -230,6 +293,7 @@ class GameRenderer(
         flatShader = ShaderProgram("flat", FLAT_VS, FLAT_FS)
         skyShader = ShaderProgram("sky", SKY_VS, SKY_FS)
         shadowShader = ShaderProgram("shadow", SHADOW_VS, SHADOW_FS)
+        smokeShader = ShaderProgram("smoke", SMOKE_VS, SMOKE_FS)
 
         loadTextures()
         buildSkyMesh()
@@ -277,6 +341,13 @@ class GameRenderer(
         // server-picked night preset (both are tiny generated panoramas).
         skyTexDay = textureLoader.load("sky.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
         skyTexNight = textureLoader.load("sky_night.jpg", GLES30.GL_REPEAT, GLES30.GL_CLAMP_TO_EDGE)
+        // P10-3: derivative-bump height maps, one per world material.
+        bumpTex[Material.FLOOR] = textureLoader.load("floor_bump.png")
+        bumpTex[Material.WALL] = textureLoader.load("wall_bump.png")
+        bumpTex[Material.CRATE] = textureLoader.load("crate_bump.png", GLES30.GL_CLAMP_TO_EDGE)
+        bumpTex[Material.PILLAR] = textureLoader.load("pillar_bump.png")
+        bumpTex[Material.COVER] = textureLoader.load("cover_bump.png", GLES30.GL_CLAMP_TO_EDGE)
+        bumpTex[Material.RAMP] = textureLoader.load("ramp_bump.png")
     }
 
     private fun texGain(material: Int): Float = when (material) {
@@ -444,13 +515,6 @@ class GameRenderer(
             fpsAccum = 0f
         }
 
-        // Post pipeline: when up, everything below draws into the off-screen
-        // scene buffer and endSceneAndCompose puts it on the display. When the
-        // driver declined the FBO matrix, this branch disappears to nothing.
-        if (postFx.ready) postFx.beginScene()
-
-        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
-
         val lit = litShader ?: return
         val flat = flatShader ?: return
         val sky = skyShader ?: return
@@ -471,6 +535,24 @@ class GameRenderer(
         // P2-5: while dead, the camera borrows the killer's eyes.
         if (playing && !state.alive) applySpectatorCamera()
         state.publishViewProj(camera.viewProjection)
+
+        // ---- P10-1: sun shadow depth pass ------------------------------------
+        // Runs BEFORE the scene pass against its own FBO; the static light
+        // volume makes it camera-independent. Only ~25 draw calls (world plus
+        // player bodies), so the cost is noise on any GLES3 GPU.
+        if (shadowMap.ready && materialMeshes.isNotEmpty()) {
+            renderShadowDepthPass()
+        }
+
+        // Post pipeline: when up, everything below draws into the off-screen
+        // scene buffer and endSceneAndCompose puts it on the display. When the
+        // driver declined the FBO matrix, this branch disappears to nothing.
+        if (postFx.ready) postFx.beginScene()
+
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT or GLES30.GL_DEPTH_BUFFER_BIT)
+
+        // ---- P10-5: hand the post chain the sun's screen position ------------
+        updateSunRayFeed()
 
         // ---- sky ------------------------------------------------------------
         // Drawn first with depth writes off: the world overwrites it wherever
@@ -502,15 +584,39 @@ class GameRenderer(
         // the directional sun adds contrast on the lit faces. (Night preset
         // drops this hard — same albedos then read as moonlit.)
         lit.setFloat("uAmbient", ambientLight)
-        lit.setSampler("uTex", 0)
         lit.setMatrix("uModel", identity)
         lit.setVec3("uTint", 1f, 1f, 1f)
         updatePointLight(lit, nowMs, playing)
 
+        // P10 auxiliary texture units (sampler uniforms are sticky per program,
+        // set once per frame): 1 = sky panorama (env reflections), 2 = shadow
+        // map, 3 = bump height map.
+        lit.setSampler("uTex", 0)
+        lit.setSampler("uEnvMap", 1)
+        lit.setSampler("uShadowMap", 2)
+        lit.setSampler("uBump", 3)
+        lit.setMatrix("uShadowMatrix", shadowMap.lightMatrix)
+        lit.setFloat("uShadowOn", if (shadowMap.ready) 1f else 0f)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (presetNight) skyTexNight else skyTexDay)
+        if (shadowMap.ready) {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, shadowMap.depthTexture())
+        }
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+
         for ((material, mesh) in materialMeshes) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, materialTex[material] ?: whiteTex)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bumpTex[material] ?: whiteTex)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
             lit.setFloat("uTexGain", texGain(material))
             lit.setFloat("uSpec", specFor(material))
+            lit.setFloat("uRough", roughFor(material))
+            lit.setFloat("uEnvStr", envFor(material))
+            lit.setFloat("uBumpStr", bumpStrFor(material))
             lit.setFloat("uEmissive", 0.0f)
             mesh.draw()
         }
@@ -520,16 +626,19 @@ class GameRenderer(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
         lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uEnvStr", 0.0f)
+        lit.setFloat("uBumpStr", 0.0f)
         lit.setFloat("uEmissive", 0.22f)
         spawnMesh.draw()
 
         // P8-6: static neon trim ridges on tall walls/pillars. Constant glow
         // (no pulsing): bright cyan by day, a neon skyline by night.
         if (trimMesh.vertexCount > 0) {
-            lit.setFloat("uSpec", 0.0f)
+            lit.setFloat("uEnvStr", 0.12f)
             lit.setFloat("uEmissive", trimEmissive)
             trimMesh.draw()
             lit.setFloat("uEmissive", 0.0f)
+            lit.setFloat("uEnvStr", 0.0f)
         } else {
             lit.setFloat("uEmissive", 0.0f)
         }
@@ -545,10 +654,13 @@ class GameRenderer(
             // Pads: static ring, constant powered glow (no pulse waves).
             if (padMesh.vertexCount > 0) {
                 lit.setFloat("uSpec", 0.25f)
+                lit.setFloat("uRough", 0.30f)
+                lit.setFloat("uEnvStr", 0.18f)
                 lit.setFloat("uEmissive", 0.42f)
                 padMesh.draw()
                 lit.setFloat("uEmissive", 0.0f)
                 lit.setFloat("uSpec", 0.0f)
+                lit.setFloat("uEnvStr", 0.0f)
             }
 
             drawPickups(lit, playing, dt)
@@ -602,6 +714,9 @@ class GameRenderer(
             particles.muzzleSparks(mx, my, mz, camera.forwardX, camera.forwardY, camera.forwardZ)
         }
         prevMuzzleActive = muzzleActive
+
+        // ---- P10-7 smoke: mid-frame depth snapshot + soft billboards -------
+        drawSmoke(dt)
 
         updateParticles(dt, playing)
         buildEffects(nowMs, muzzleActive)
@@ -834,7 +949,54 @@ class GameRenderer(
             bobPhase += dt * 1.5f
         }
 
-        camera.setPose(state.eyeX, eyeY, state.eyeZ, state.viewYaw, state.viewPitch)
+        // ---- P10-2 gun feel ---------------------------------------------------
+        // a) viewmodel angle lag: the gun trails the swipe with exponential
+        //    easing (14/s) — the sub-perceptual delay that makes CS2 feel
+        //    "heavy" instead of a camera-locked sprite.
+        val yawNow = state.viewYaw
+        val pitchNow = state.viewPitch
+        if (!vmInit || dt <= 0f) {
+            vmYawLag = yawNow; vmPitchLag = pitchNow; vmInit = true
+        }
+        val k = (1f - kotlin.math.exp(-14f * dt)).coerceIn(0f, 1f)
+        // shortest-path wrap so 359° -> 1° does not spin the lag around
+        val yawDelta = ((yawNow - vmYawLag + 540f) % 360f) - 180f
+        vmYawLag += yawDelta * k
+        vmPitchLag += (pitchNow - vmPitchLag) * k
+        // residual sway used by drawWeapon (degrees the viewmodel is behind)
+        vmSwayYaw = (((yawNow - vmYawLag + 540f) % 360f) - 180f)
+            .coerceIn(-6f, 6f)
+        vmSwayPitch = (pitchNow - vmPitchLag).coerceIn(-6f, 6f)
+
+        // b) landing dip: watch vertical velocity for the grounded edge.
+        val safeDt = dt.coerceAtLeast(1e-4f)
+        val dxFrame = state.eyeX - prevEyeX
+        val dyFrame = eyeY - prevEyeY
+        val dzFrame = state.eyeZ - prevEyeZ
+        prevEyeX = state.eyeX; prevEyeY = eyeY; prevEyeZ = state.eyeZ
+        val vy = dyFrame / safeDt
+        if (!prevOnGround && state.localOnGround && vy < -3.5f) {
+            landDip = (-vy * 0.016f).coerceIn(0.04f, 0.13f)
+            if (vy < -5.5f) {
+                smoke.landingDust(state.eyeX, state.eyeY - 1.6f, state.eyeZ, (-vy / 9f).coerceIn(0.5f, 1.3f))
+            }
+        }
+        landDip *= kotlin.math.exp(-9f * dt)
+        prevOnGround = state.localOnGround
+
+        // c) strafe lean: TRUE lateral speed along the previous-frame camera
+        //    right axis (works with look-direction too — no input flags
+        //    needed, so turn-strafes lean correctly). Smoothed ~100 ms.
+        val latV = (dxFrame * camera.rightX + dzFrame * camera.rightZ) / safeDt
+        val leanTarget = (latV / GameConstants.MOVE_SPEED).coerceIn(-1f, 1f)
+        strafeLean += (leanTarget - strafeLean) * (1f - kotlin.math.exp(-10f * dt))
+
+        eyeY -= landDip * 0.55f  // camera dips a hair on touchdown
+        camera.setPose(
+            state.eyeX, eyeY, state.eyeZ,
+            yawNow, pitchNow - landDip * 14f,
+            rollDeg = strafeLean * 1.7f,
+        )
     }
 
     /**
@@ -896,6 +1058,8 @@ class GameRenderer(
 
         lit.setMatrix("uModel", identity)
         lit.setFloat("uSpec", 0.35f)
+        lit.setFloat("uRough", 0.28f)
+        lit.setFloat("uEnvStr", 0.35f)
         var any = false
         for (p in pickups) {
             if (!p.active) continue
@@ -914,6 +1078,7 @@ class GameRenderer(
         if (any) {
             lit.setFloat("uEmissive", 0.0f)
             lit.setFloat("uSpec", 0.0f)
+            lit.setFloat("uEnvStr", 0.0f)
             lit.setVec3("uTint", 1f, 1f, 1f)
             lit.setMatrix("uModel", identity)
         }
@@ -945,6 +1110,8 @@ class GameRenderer(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, grenadeTex)
         lit.setFloat("uTexGain", 3.36f)
         lit.setFloat("uSpec", 0.35f)
+        lit.setFloat("uRough", 0.50f)
+        lit.setFloat("uEnvStr", 0.30f)
         for (g in list) {
             val blink = g.fuseTicks > 30 && ((nowMs / 90L) and 1L) == 0L
             if (blink) {
@@ -959,11 +1126,26 @@ class GameRenderer(
             lit.setMatrix("uModel", model)
             grenodeMesh.draw()
 
-            val slot = prevGrenades.getOrPut(g.id) { FloatArray(3) }
+            // P10-7: faint dark trail while the grenade is in flight — the
+            // arc reads instantly across the arena, exactly like a CS smoke
+            // shell streak (puff cadence throttled by the slot's timestamp).
+            val slot = prevGrenades.getOrPut(g.id) { FloatArray(4) }
+            if (nowMs - slot[3] > 90f) {
+                slot[3] = nowMs.toFloat()
+                smoke.spawn(
+                    g.x, g.y, g.z,
+                    0f, 0.18f, 0f,
+                    ttl = 0.5f, startSize = 0.10f, growPerSec = 1.2f,
+                    rFrom = 0.28f, gFrom = 0.27f, bFrom = 0.25f,
+                    rTo = 0.34f, gTo = 0.33f, bTo = 0.31f,
+                    alpha = 0.28f,
+                )
+            }
             slot[0] = g.x; slot[1] = g.y; slot[2] = g.z
         }
         lit.setFloat("uEmissive", 0.0f)
         lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uEnvStr", 0.0f)
         lit.setFloat("uTexGain", 1.0f)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setVec3("uTint", 1f, 1f, 1f)
@@ -979,6 +1161,8 @@ class GameRenderer(
                 if (!alive) {
                     iter.remove()
                     particles.explosion(pos[0], pos[1], pos[2])
+                    // P10-7: the boom also throws its soft smoke cloud.
+                    smoke.explosion(pos[0], pos[1], pos[2])
                     // P8-3: the blast feeds the dynamic point light for a
                     // quarter second — nearby walls flash with the boom.
                     blastFromMs = nowMs
@@ -1048,6 +1232,9 @@ class GameRenderer(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, playerTex)
         lit.setFloat("uTexGain", 1.82f)
         lit.setFloat("uSpec", 0.28f)
+        lit.setFloat("uRough", 0.50f)
+        lit.setFloat("uEnvStr", 0.20f)
+        lit.setFloat("uBumpStr", 0.0f)
 
         // ---- legs -------------------------------------------------------------
         // Swing amplitude grows with speed up to a full run; phase advances with
@@ -1139,10 +1326,16 @@ class GameRenderer(
             }
         }
 
-        camera.viewModelMatrix(model, 0.155f + bobX, -0.135f + bobY + offY, offZ)
-        // Pitch the muzzle up slightly with recoil.
+        // P10-2: the viewmodel trails the swipe (lagged angles maintained in
+        // updateGameCamera), dips on landing and tilts into strafes — the
+        // classic "weighty gun" read-out instead of a camera-locked sprite.
+        val swayX = -vmSwayYaw * 0.004f
+        val swayY = -vmSwayPitch * 0.0026f - landDip * 0.50f
+        camera.viewModelMatrix(model, 0.155f + bobX + swayX, -0.135f + bobY + offY + swayY, offZ)
         Matrix.setIdentityM(scratch, 0)
-        Matrix.rotateM(scratch, 0, kick * 2.2f, 1f, 0f, 0f)
+        Matrix.rotateM(scratch, 0, -vmSwayYaw * 0.6f, 0f, 1f, 0f)
+        Matrix.rotateM(scratch, 0, kick * 2.2f - vmSwayPitch * 0.5f, 1f, 0f, 0f)
+        Matrix.rotateM(scratch, 0, vmSwayYaw * 0.9f + strafeLean * 2.2f, 0f, 0f, 1f)
         Matrix.scaleM(scratch, 0, scaleX, scaleY, scaleZ)
         Matrix.multiplyMM(scratch, 0, model, 0, scratch, 0)
 
@@ -1166,10 +1359,19 @@ class GameRenderer(
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, weaponTex)
         lit.setFloat("uTexGain", 2.22f)
         lit.setFloat("uSpec", 0.55f)
+        lit.setFloat("uRough", 0.28f)
+        // P10-1: the viewmodel never reads the sun shadow map — it floats in
+        // personal space, world shadows on it only read as artifacts.
+        lit.setFloat("uShadowOn", 0f)
+        // P10-4: gunmetal glassiness — the sky panorama mirrored on the slide.
+        lit.setFloat("uEnvStr", 0.40f)
+        lit.setFloat("uBumpStr", 0.0f)
         weaponMesh.draw()
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, whiteTex)
         lit.setFloat("uTexGain", 1.0f)
         lit.setFloat("uSpec", 0.0f)
+        lit.setFloat("uEnvStr", 0.0f)
+        lit.setFloat("uShadowOn", if (shadowMap.ready) 1f else 0f)
         lit.setFloat("uFogDensity", fogDensityPlay)
     }
 
@@ -1211,8 +1413,8 @@ class GameRenderer(
     }
 
     /**
-     * P8-2: Blinn sun-specular strength per material (0 = matte). Concrete
-     * and metal get a sunny glint; wood stays dry.
+     * P8-2 → P10-6: GGX sun-specular intensity per material (0 = matte).
+     * Concrete and metal get a sunny glint; wood stays dry.
      */
     private fun specFor(material: Int): Float = when (material) {
         Material.FLOOR -> 0.30f
@@ -1222,6 +1424,39 @@ class GameRenderer(
         Material.COVER -> 0.16f
         Material.RAMP -> 0.14f
         else -> 0.20f
+    }
+
+    /** P10-6: GGX roughness per material — metal tight, concrete broad. */
+    private fun roughFor(material: Int): Float = when (material) {
+        Material.FLOOR -> 0.42f
+        Material.WALL -> 0.55f
+        Material.PILLAR -> 0.25f
+        Material.CRATE -> 0.80f
+        Material.COVER -> 0.60f
+        Material.RAMP -> 0.45f
+        else -> 0.50f
+    }
+
+    /** P10-4: sky-panorama reflection strength (0 = no reflection). */
+    private fun envFor(material: Int): Float = when (material) {
+        Material.FLOOR -> 0.045f
+        Material.WALL -> 0.030f
+        Material.PILLAR -> 0.080f
+        Material.CRATE -> 0.020f
+        Material.COVER -> 0.040f
+        Material.RAMP -> 0.050f
+        else -> 0.030f
+    }
+
+    /** P10-3: derivative-bump relief strength per material. */
+    private fun bumpStrFor(material: Int): Float = when (material) {
+        Material.FLOOR -> 0.55f
+        Material.WALL -> 0.45f
+        Material.PILLAR -> 0.32f
+        Material.CRATE -> 0.50f
+        Material.COVER -> 0.35f
+        Material.RAMP -> 0.40f
+        else -> 0.30f
     }
 
     /** Builds camera-facing quads for tracers and the muzzle flash. */
@@ -1351,6 +1586,112 @@ class GameRenderer(
         }
     }
 
+    /**
+     * P10-1: static-sun depth pass. Casters: every static material mesh,
+     * spawn/pad/trim meshes and full player bodies (translate + yaw matches
+     * the main pass minus lean/crouch — imperceptible in a shadow). Legs and
+     * pickups are skipped: a one-frame-main-pass mismatch would cost more in
+     * draw calls than it adds in shadow fidelity.
+     */
+    private fun renderShadowDepthPass() {
+        shadowMap.beginDepthPass()
+        shadowMap.setMvp(identity)
+        for ((_, mesh) in materialMeshes) mesh.draw()
+        spawnMesh.draw()
+        if (trimMesh.vertexCount > 0) trimMesh.draw()
+        if (padMesh.vertexCount > 0) padMesh.draw()
+        for (i in renderEntities.indices) {
+            val e = renderEntities[i]
+            if (!e.alive) continue
+            Matrix.setIdentityM(scratch2, 0)
+            Matrix.translateM(scratch2, 0, e.x, e.y, e.z)
+            Matrix.rotateM(scratch2, 0, -e.yaw, 0f, 1f, 0f)
+            shadowMap.setMvp(scratch2)
+            playerBodyMesh.draw()
+        }
+        shadowMap.endDepthPass()
+    }
+
+    /**
+     * P10-5: projects the sun into screen uv for the god-ray pass. Fade rule
+     * mirrors the flare: rays live while the look direction approaches the
+     * sun azimuth; below [FLARE_MIN_VIS]·0.9 the gain bottoms out and PostFx
+     * skips the pass entirely.
+     */
+    private fun updateSunRayFeed() {
+        val vis = camera.forwardX * SUN_X + camera.forwardY * SUN_Y + camera.forwardZ * SUN_Z
+        if (vis <= FLARE_MIN_VIS * 0.9f) {
+            postFx.setSunRay(0.5f, 0.5f, 0f)
+            return
+        }
+        sunWorldS[0] = camera.x + SUN_X * 100f
+        sunWorldS[1] = camera.y + SUN_Y * 100f
+        sunWorldS[2] = camera.z + SUN_Z * 100f
+        sunWorldS[3] = 1f
+        Matrix.multiplyMV(sunClipS, 0, camera.viewProjection, 0, sunWorldS, 0)
+        if (sunClipS[3] <= 0.0001f) {
+            postFx.setSunRay(0.5f, 0.5f, 0f)
+            return
+        }
+        val nx = sunClipS[0] / sunClipS[3]
+        val ny = sunClipS[1] / sunClipS[3]
+        val t = ((vis - FLARE_MIN_VIS * 0.9f) / (1f - FLARE_MIN_VIS * 0.9f)).coerceIn(0f, 1f)
+        // Day: visible shafts; night: a faint moon halo at most.
+        val gain = t * t * (0.30f + 0.35f * sunGain)
+        postFx.setSunRay(nx * 0.5f + 0.5f, ny * 0.5f + 0.5f, gain)
+    }
+
+    // ------------------------------------------------------------- smoke pass
+
+    /**
+     * P10-7: resolves the mid-frame scene depth and draws all live smoke
+     * sprites with normal alpha blending. The pass sits between the opaque
+     * world and the additive spark batch: smoke must slide UNDER tracers and
+     * flashes, not over them.
+     */
+    private fun drawSmoke(dt: Float) {
+        smoke.update(dt)
+        if (smoke.alive() <= 0) return
+        val shader = smokeShader ?: return
+        val depthTex = postFx.softDepthTexture()
+        if (postFx.ready && depthTex != 0) postFx.resolveSoftDepth()
+        val floats = smoke.build(
+            smokeScratch,
+            camera.rightX, camera.rightY, camera.rightZ,
+            camera.upX, camera.upY, camera.upZ,
+        )
+        if (floats <= 0) return
+        smokeMesh.uploadDynamic(smokeScratch, floats)
+
+        shader.use()
+        shader.setMatrix("uViewProj", camera.viewProjection)
+        shader.setSampler("uSceneDepth", 1)
+        if (postFx.ready && depthTex != 0) {
+            shader.setVec2("uInvSize", 1f / postFx.sceneWidth(), 1f / postFx.sceneHeight())
+        } else {
+            // no post pipeline: bind the white tex (depth reads "far") — the
+            // soft fade becomes a no-op and puffs show raw radial alpha.
+            shader.setVec2("uInvSize", 1f / 1280f, 1f / 720f)
+        }
+        shader.setFloat("uNear", 0.06f)
+        shader.setFloat("uFar", 260f)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(
+            GLES30.GL_TEXTURE_2D,
+            if (depthTex != 0) depthTex else whiteTex,
+        )
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        GLES30.glDepthMask(false)
+        GLES30.glDisable(GLES30.GL_CULL_FACE)
+        smokeMesh.draw()
+        GLES30.glEnable(GLES30.GL_CULL_FACE)
+        GLES30.glDepthMask(true)
+        GLES30.glDisable(GLES30.GL_BLEND)
+    }
+
     /** One camera-facing radial fan: bright centre vertex, zero rim. */
     private fun addFlareFan(cx: Float, cy: Float, cz: Float, radius: Float, r: Float, g: Float, b: Float) {
         var prevX = cx + camera.rightX * radius
@@ -1431,7 +1772,11 @@ class GameRenderer(
                         val d = RayMath.raycastArena(sunRay, sunDirVec, SUN_SHADOW_DIST, arena)
                         if (d < SUN_SHADOW_DIST - 0.01f) blocked++
                     }
-                    sunGrid[gi++] = 1f - 0.50f * blocked / SUN_JITTER.size
+                    // P10-1 note: the real-time sun shadow map now owns the
+                    // directional shade; this baked layer is dialled down
+                    // from 0.50 to 0.22 so the two agree instead of doubling
+                    // up (kept for penumbra softening beyond the volume).
+                    sunGrid[gi++] = 1f - 0.22f * blocked / SUN_JITTER.size
                     gx += tile
                 }
                 gz += tile
@@ -1505,6 +1850,16 @@ class GameRenderer(
                     Material.COVER, Material.CRATE -> 0.45f
                     else -> 0.15f
                 },
+                // P10-8: big faces subdivide so the baked corner AO can vary
+                // over the surface (1 m cells on walls/pillars/covers).
+                subdiv = when (brush.material) {
+                    Material.WALL, Material.PILLAR, Material.COVER -> 1.0f
+                    else -> 0f
+                },
+                gi = when (brush.material) {
+                    Material.WALL, Material.PILLAR, Material.COVER -> wallGi
+                    else -> null
+                },
             )
         }
 
@@ -1563,6 +1918,10 @@ class GameRenderer(
             )
         }
         trimMesh.upload(tb.raw(), tb.floatCount)
+
+        // P10-1: (re)fit the static sun-shadow volume to this arena.
+        shadowMap.dispose()  // upload path runs on every surface/(re)create
+        shadowMap.init(arena, SUN_X, SUN_Y, SUN_Z)
 
         prevGrenades.clear() // a new map invalidates blast tracking
         AndroidLog.i(
@@ -1748,7 +2107,11 @@ class GameRenderer(
         flatShader?.dispose()
         skyShader?.dispose()
         shadowShader?.dispose()
+        smokeShader?.dispose()
         shadowShader = null
+        smokeShader = null
+        shadowMap.dispose()
+        smokeMesh.dispose()
         for (mesh in materialMeshes.values) mesh.dispose()
         materialMeshes.clear()
         spawnMesh.dispose()
@@ -1843,12 +2206,23 @@ class GameRenderer(
             uniform float uTexGain;
             // Pure additive glow in vertex-colour space (spawn strips, trim).
             uniform float uEmissive;
-            // P8-2: Blinn specular strength toward the sun (0 = matte).
+            // P10-6: GGX sun specular (intensity + roughness per material).
             uniform float uSpec;
+            uniform float uRough;
             // P8-3: one dynamic point light (muzzle flash / grenade blast).
             uniform vec3  uPtPos;
             uniform vec3  uPtColor;
             uniform float uPtGain;
+            // P10-1: sun shadow map (compare sampler on unit 2).
+            uniform sampler2DShadow uShadowMap;
+            uniform mat4  uShadowMatrix;
+            uniform float uShadowOn;
+            // P10-3: derivative bump map (height texture on unit 3).
+            uniform sampler2D uBump;
+            uniform float uBumpStr;
+            // P10-4: environment reflection off the sky panorama (unit 1).
+            uniform sampler2D uEnvMap;
+            uniform float uEnvStr;
             in vec3 vNormal;
             in vec3 vColor;
             in vec3 vWorld;
@@ -1856,13 +2230,49 @@ class GameRenderer(
             out vec4 fragColor;
             void main() {
                 vec3 n = normalize(vNormal);
+                // P10-3 derivative bump ("bump mapping unparametrized
+                // surfaces"): perturbs the normal from the height texture
+                // using only screen-space derivatives — no tangents needed.
+                if (uBumpStr > 0.0) {
+                    float hll = texture(uBump, vUv).r;
+                    vec3 sx = dFdx(vWorld);
+                    vec3 sy = dFdy(vWorld);
+                    vec3 R1 = cross(sy, n);
+                    vec3 R2 = cross(n, sx);
+                    float det = dot(sx, R1);
+                    vec2 dH = vec2(dFdx(hll), dFdy(hll));
+                    vec3 grad = sign(det) * (dH.x * R1 + dH.y * R2);
+                    n = normalize(abs(det) * n - uBumpStr * 90.0 * grad);
+                }
                 vec3 ld = normalize(uLightDir);
                 float lambert = max(dot(n, ld), 0.0);
+                // P10-1 sun shadow: HW compare (bilinear PCF) + 4-tap cross.
+                float shadow = 1.0;
+                if (uShadowOn > 0.5) {
+                    vec4 sc = uShadowMatrix * vec4(vWorld, 1.0);
+                    vec3 suv = sc.xyz / sc.w;
+                    if (all(greaterThanEqual(suv, vec3(0.0))) &&
+                        all(lessThanEqual(suv, vec3(1.0)))) {
+                        // slope-scaled bias: grazing angles offset deeper.
+                        float bias = clamp(0.0016f * (1.0 - lambert) + 0.0004f, 0.0004f, 0.0035f);
+                        float zref = suv.z - bias;
+                        float s = texture(uShadowMap, vec3(suv.xy, zref));
+                        vec2 ts = vec2(1.5f / 1024.0);
+                        s += texture(uShadowMap, vec3(suv.xy + vec2( ts.x,  0.0), zref));
+                        s += texture(uShadowMap, vec3(suv.xy + vec2(-ts.x,  0.0), zref));
+                        s += texture(uShadowMap, vec3(suv.xy + vec2(  0.0, ts.x), zref));
+                        s += texture(uShadowMap, vec3(suv.xy + vec2(  0.0,-ts.x), zref));
+                        shadow = s / 5.0f;
+                    }
+                }
                 // Hemisphere term: sky above, bounce below. The daylight base
                 // is high (the whole dome is a light source), so vertical
                 // walls stay readable without a second light or shadow maps.
                 float hemi = 0.65 + 0.35 * n.y;
-                float light = uAmbient * hemi + (1.0 - uAmbient) * lambert;
+                // The sun's directional term goes through the shadow map —
+                // real moving shadows off players and geometry; ambient
+                // always stays (sky dome is never eclipsed).
+                float light = uAmbient * hemi + (1.0 - uAmbient) * lambert * shadow;
                 // The texture is a greyscale-ish detail layer: uTexGain restores
                 // the palette brightness (1/mean-luma), so the original vertex
                 // colours survive texturing and a white 1x1 fallback texture is
@@ -1880,19 +2290,38 @@ class GameRenderer(
                     float ndl = max(dot(n, dv / max(d, 0.001)), 0.0);
                     c += surf * uPtColor * (att * ndl * uPtGain);
                 }
-                // P8-2: Blinn glint toward the sun, gated by lambert so only
-                // the sun-facing sides sparkle. It is what makes the concrete
-                // read as sunlit when the camera moves.
-                if (uSpec > 0.0) {
-                    vec3 v = normalize(uEye - vWorld);
-                    vec3 h = normalize(v + ld);
-                    float spec = pow(max(dot(n, h), 0.0), 48.0) * uSpec;
-                    c += vec3(1.0, 0.98, 0.92) * spec * (0.25 + 0.75 * lambert);
+                vec3 viewVec = uEye - vWorld;
+                if (uSpec > 0.0 || uEnvStr > 0.0) {
+                    vec3 v = normalize(viewVec);
+                    // P10-6: GGX distribution — physically-shaped lobe, tight
+                    // on metal (low roughness), wide on concrete.
+                    if (uSpec > 0.0) {
+                        vec3 h = normalize(v + ld);
+                        float ndh = max(dot(n, h), 0.0);
+                        float r2 = uRough * uRough;
+                        float denom = ndh * ndh * (r2 - 1.0) + 1.0;
+                        float D = (r2 * r2) / (3.14159 * denom * denom);
+                        float spec = D * uSpec * 0.11 * shadow;
+                        spec *= 0.20 + 0.80 * lambert;
+                        c += vec3(1.0, 0.98, 0.92) * spec;
+                    }
+                    // P10-4: environment reflection off the sky panorama with
+                    // a Fresnel rise at grazing angles — metal and visors pick
+                    // up the world they stand in.
+                    if (uEnvStr > 0.0) {
+                        vec3 rr = reflect(-v, n);
+                        vec2 euv = vec2(atan(rr.z, rr.x) * 0.15915494 + 0.5,
+                                        clamp(1.045 - rr.y * 1.18, 0.045, 1.0));
+                        vec3 env = texture(uEnvMap, euv).rgb;
+                        float fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+                        // Scale by incoming light so shadows stay believable.
+                        c += env * (uEnvStr * (0.25 + 0.75 * fres)) * (0.35 + 0.65 * light);
+                    }
                 }
                 if (uEmissive > 0.0) {
                     c += vColor * uEmissive;
                 }
-                float dist = length(vWorld - uEye);
+                float dist = length(viewVec);
                 float fog = 1.0 - exp(-uFogDensity * dist);
                 c = mix(c, uFogColor, clamp(fog, 0.0, 1.0));
                 fragColor = vec4(c, 1.0);
@@ -2061,6 +2490,52 @@ class GameRenderer(
             out vec4 fragColor;
             void main() {
                 fragColor = vec4(vColor, 1.0);
+            }
+        """
+
+        // ---- P10-7 smoke -----------------------------------------------------
+        private const val SMOKE_VS = """#version 300 es
+            uniform mat4 uViewProj;
+            in vec3 aPos;
+            in vec3 aColor;
+            in float aAlpha;
+            in vec2 aUv;
+            out vec3 vColor;
+            out float vAlpha;
+            out vec2 vUv;
+            void main() {
+                vColor = aColor;
+                vAlpha = aAlpha;
+                vUv = aUv;
+                gl_Position = uViewProj * vec4(aPos, 1.0);
+            }
+        """
+
+        /**
+         * Soft smoke: radial falloff × vertex alpha × per-pixel depth fade.
+         * The depth fade samples the scene-depth snapshot (resolved mid-frame)
+         * and linearises both depths so a puff clipped by a wall melts into it
+         * instead of showing a hard intersection line. uSoftOn=0 degrades to
+         * plain radial alpha (white depth tex bound → compare reads far).
+         */
+        private const val SMOKE_FS = """#version 300 es
+            precision mediump float;
+            uniform sampler2D uSceneDepth;
+            uniform vec2 uInvSize;
+            uniform float uNear;
+            uniform float uFar;
+            in vec3 vColor;
+            in float vAlpha;
+            in vec2 vUv;
+            out vec4 fragColor;
+            float lin(float z) { return (uNear * uFar) / (uFar - z * (uFar - uNear)); }
+            void main() {
+                float radial = 1.0 - smoothstep(0.30, 1.0, length(vUv));
+                float sceneZ = texture(uSceneDepth, gl_FragCoord.xy * uInvSize).r;
+                float soft = clamp((lin(sceneZ) - lin(gl_FragCoord.z)) * 1.6, 0.0, 1.0);
+                float a = vAlpha * radial * soft;
+                if (a < 0.004) discard;
+                fragColor = vec4(vColor, a);
             }
         """
     }

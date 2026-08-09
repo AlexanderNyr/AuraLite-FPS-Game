@@ -27,6 +27,7 @@ class ShaderProgram(name: String, vertexSrc: String, fragmentSrc: String) {
         GLES30.glBindAttribLocation(program, ATTRIB_NORMAL, "aNormal")
         GLES30.glBindAttribLocation(program, ATTRIB_COLOR, "aColor")
         GLES30.glBindAttribLocation(program, ATTRIB_UV, "aUv")
+        GLES30.glBindAttribLocation(program, ATTRIB_ALPHA, "aAlpha")
         GLES30.glLinkProgram(program)
 
         val status = IntArray(1)
@@ -105,5 +106,7 @@ class ShaderProgram(name: String, vertexSrc: String, fragmentSrc: String) {
         const val ATTRIB_NORMAL = 1
         const val ATTRIB_COLOR = 2
         const val ATTRIB_UV = 3
+        /** P10: per-vertex alpha — only the soft-smoke program reads it. */
+        const val ATTRIB_ALPHA = 4
     }
 }

@@ -54,7 +54,11 @@ class Camera {
         Matrix.perspectiveM(projection, 0, fovYDegrees, aspect, near, far)
     }
 
-    fun setPose(px: Float, py: Float, pz: Float, yawDeg: Float, pitchDeg: Float) {
+    fun setPose(
+        px: Float, py: Float, pz: Float,
+        yawDeg: Float, pitchDeg: Float,
+        rollDeg: Float = 0f,
+    ) {
         x = px; y = py; z = pz
         yaw = yawDeg
         pitch = MathUtil.clamp(pitchDeg, -89.9f, 89.9f)
@@ -75,6 +79,19 @@ class Camera {
         ux = ry * fz - rz * fy
         uy = rz * fx - rx * fz
         uz = rx * fy - ry * fx
+
+        // P10-2: optional roll about the forward axis (strafe lean). Trivial
+        // angles only: rotate up/right in their span — right X up = -forward
+        // gives the rotation pair up' = up·c + right·s.
+        if (rollDeg != 0f) {
+            val rr = rollDeg * MathUtil.DEG_TO_RAD
+            val c = cos(rr); val s = sin(rr)
+            // Both axes rotate from the PRE-rotation values (no double roll).
+            val nux = ux * c + rx * s; val nuy = uy * c + ry * s; val nuz = uz * c + rz * s
+            val nrx = ux * (-s) + rx * c; val nry = uy * (-s) + ry * c; val nrz = uz * (-s) + rz * c
+            ux = nux; uy = nuy; uz = nuz
+            rx = nrx; ry = nry; rz = nrz
+        }
 
         Matrix.setLookAtM(
             view, 0,

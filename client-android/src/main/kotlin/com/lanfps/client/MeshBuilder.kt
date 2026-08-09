@@ -112,6 +112,11 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         uvMode: UvMode = UvMode.FIT,
         uvScale: Float = 4f,
         glowBottom: Float = 0f,
+        // P10-8: face subdivision size in metres (0 = one quad per face) and a
+        // bake-in corner-AO factor callback evaluated per emitted vertex
+        // (bigger walls get subdivided so the factor varies spatially).
+        subdiv: Float = 0f,
+        gi: ((Float, Float, Float, Float, Float, Float) -> Float)? = null,
     ) {
         val lo = if (shadeBottom) 0.72f else 1f
         val hi = 1f
@@ -174,10 +179,13 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         fun v(x: Float, y: Float, z: Float, nx: Float, ny: Float, nz: Float) {
             val s = shade(y)
             val glow = bounce(y)
+            val gf = gi?.invoke(x, y, z, nx, ny, nz) ?: 1f
             val (uu, vv) = uv(nx, ny, nz, x, y, z)
             vertex(
                 x, y, z, nx, ny, nz,
-                r * s + 0.045f * glow, g * s + 0.085f * glow, b * s + 0.150f * glow,
+                (r * s + 0.045f * glow) * gf,
+                (g * s + 0.085f * glow) * gf,
+                (b * s + 0.150f * glow) * gf,
                 uu, vv,
             )
         }
@@ -189,8 +197,42 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
             dx: Float, dy: Float, dz: Float,
             nx: Float, ny: Float, nz: Float,
         ) {
-            v(ax, ay, az, nx, ny, nz); v(bx, by, bz, nx, ny, nz); v(cx, cy, cz, nx, ny, nz)
-            v(ax, ay, az, nx, ny, nz); v(cx, cy, cz, nx, ny, nz); v(dx, dy, dz, nx, ny, nz)
+            if (subdiv <= 0.01f || gi == null) {
+                v(ax, ay, az, nx, ny, nz); v(bx, by, bz, nx, ny, nz); v(cx, cy, cz, nx, ny, nz)
+                v(ax, ay, az, nx, ny, nz); v(cx, cy, cz, nx, ny, nz); v(dx, dy, dz, nx, ny, nz)
+                return
+            }
+            // P10-8: subdivide the planar face into cells ~subdiv metres wide
+            // so the corner-AO factor has spatial resolution to vary over.
+            val bu = (kotlin.math.sqrt(
+                (bx - ax) * (bx - ax) + (by - ay) * (by - ay) + (bz - az) * (bz - az),
+            ) / subdiv).toInt().coerceIn(1, 48)
+            val bv = (kotlin.math.sqrt(
+                (dx - ax) * (dx - ax) + (dy - ay) * (dy - ay) + (dz - az) * (dz - az),
+            ) / subdiv).toInt().coerceIn(1, 48)
+            for (j in 0 until bv) {
+                for (i in 0 until bu) {
+                    val t0 = i.toFloat() / bu
+                    val t1 = (i + 1).toFloat() / bu
+                    val s0 = j.toFloat() / bv
+                    val s1 = (j + 1).toFloat() / bv
+                    fun lerpAt(u: Float, w: Float): FloatArray = floatArrayOf(
+                        ax + (bx - ax) * u + (dx - ax) * w,
+                        ay + (by - ay) * u + (dy - ay) * w,
+                        az + (bz - az) * u + (dz - az) * w,
+                    )
+                    val p00 = lerpAt(t0, s0)
+                    val p10 = lerpAt(t1, s0)
+                    val p11 = lerpAt(t1, s1)
+                    val p01 = lerpAt(t0, s1)
+                    v(p00[0], p00[1], p00[2], nx, ny, nz)
+                    v(p10[0], p10[1], p10[2], nx, ny, nz)
+                    v(p11[0], p11[1], p11[2], nx, ny, nz)
+                    v(p00[0], p00[1], p00[2], nx, ny, nz)
+                    v(p11[0], p11[1], p11[2], nx, ny, nz)
+                    v(p01[0], p01[1], p01[2], nx, ny, nz)
+                }
+            }
         }
 
         // +X
@@ -215,9 +257,11 @@ class MeshBuilder(private val withNormals: Boolean = true, initialCapacity: Int 
         uvMode: UvMode = UvMode.FIT,
         uvScale: Float = 4f,
         glowBottom: Float = 0f,
+        subdiv: Float = 0f,
+        gi: ((Float, Float, Float, Float, Float, Float) -> Float)? = null,
     ) = box(
         aabb.minX, aabb.minY, aabb.minZ, aabb.maxX, aabb.maxY, aabb.maxZ,
-        r, g, b, shadeBottom, uvMode, uvScale, glowBottom,
+        r, g, b, shadeBottom, uvMode, uvScale, glowBottom, subdiv, gi,
     )
 
     /**
