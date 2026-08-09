@@ -329,8 +329,13 @@ class PostFx {
     }
 
     companion object {
-        /** Luminance above which a fragment joins the bloom chain. */
-        private const val BLOOM_THRESHOLD = 0.60f
+        /**
+         * Luminance above which a fragment joins the bloom chain. Raised for
+         * the daylight scene: the sky band and haze fog sit at 0.7+ luma and
+         * must NOT halo — bloom stays reserved for the sun disc, visors,
+         * tracers and muzzle flashes.
+         */
+        private const val BLOOM_THRESHOLD = 0.74f
 
         /** Soft knee width: halo grows smoothly instead of clipping. */
         private const val BLOOM_KNEE = 0.55f
@@ -338,11 +343,13 @@ class PostFx {
         /** Bloom contribution in the composite; 0.4 ≈ visible but not haze. */
         private const val BLOOM_STRENGTH = 0.42f
 
-        /** Pre-tonemap exposure. 1.0 would keep the classic palette verbatim. */
-        private const val EXPOSURE = 1.12f
+        /** Pre-tonemap exposure. Above the old night value: the exponential
+         * shoulder eats the mids, and a sunlit arena has to land bright. */
+        private const val EXPOSURE = 1.20f
 
-        /** Corner darkening at the frame edge; subtle, cinematic. */
-        private const val VIGNETTE = 0.28f
+        /** Corner darkening at the frame edge; lighter in daylight so the
+         * frame reads as airy rather than tunnelled. */
+        private const val VIGNETTE = 0.22f
 
         /** Attribute-less fullscreen triangle sourced from gl_VertexID. */
         private const val FULLSCREEN_VS = """#version 300 es
@@ -390,8 +397,9 @@ class PostFx {
 
         /**
          * Final grade: bloom add, exposure shoulder, split-tone, vignette.
-         * The split-tone mixing is deliberately gentle — the palette identity
-         * (dark blue arena, warm explosions) must survive grading intact.
+         * The split-tone mixing is deliberately gentle: sky-blue in the
+         * shadows, warm parchment in the highlights — a sunlit palette
+         * identity that still lets muzzle flashes flare orange.
          */
         private const val COMPOSE_FS = """#version 300 es
             precision mediump float;
@@ -405,8 +413,8 @@ class PostFx {
             void main() {
                 vec3 scene = texture(uScene, vUv).rgb;
                 vec3 bloom = texture(uBloom, vUv).rgb;
-                // Slightly warm-weighted bloom: orange flashes flare more than
-                // cyan neon, which reads as realism on a dark palette.
+                // Slightly warm-weighted bloom: orange flashes and sun glare
+                // flare more than cool accents, like film response outdoors.
                 vec3 c = scene + bloom * uBloomStrength * vec3(1.0, 0.96, 0.88);
                 c *= uExposure;
                 // Exponential shoulder: bright never clips hard, mids keep hue.

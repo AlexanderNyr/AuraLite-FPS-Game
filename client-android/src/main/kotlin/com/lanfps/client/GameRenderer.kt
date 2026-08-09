@@ -36,12 +36,13 @@ import kotlin.math.sin
  * detail layer multiplied by the original palette colour, so the look is a
  * strictly-upgraded version of the old flat one. Each material is its own
  * small mesh + draw call (~8 world draws total), still nothing for a GPU.
- * The sky is an inward-facing 24-sided cylinder textured with the generated
- * night panorama, completed in-shader by a sun disc (anchored to the diffuse
- * light direction so shadows and sun agree) and a slowly drifting procedural
- * cloud layer. Shadows come in two cheap layers: a baked contact darkening of
- * floor tiles near static geometry, and per-frame blob quads under every live
- * player that fade with drop height.
+ * The sky is an inward-facing cylinder textured with the generated daylight
+ * panorama (clear-blue zenith falling to a pale haze band at the horizon,
+ * the same colour the world fogs toward), completed in-shader by a sun disc
+ * (anchored to the diffuse light direction so shadows and sun agree) and a
+ * slowly drifting procedural cloud layer. Shadows come in two cheap layers:
+ * a baked contact darkening of floor tiles near static geometry, and
+ * per-frame blob quads under every live player that fade with drop height.
  *
  * On top of that sits the post chain ([PostFx]): the whole scene renders into
  * an MSAA off-screen buffer, bright pixels are blurred into a bloom halo and
@@ -236,22 +237,24 @@ class GameRenderer(
     }
 
     /**
-     * A huge inward-facing cylinder plus a zenith fan, built once. Stars are
-     * NOT fogged and NOT lit; the texture's left/right edges were blended to
-     * wrap seamlessly. Radius 110 sits well inside the 260 m far plane, and the
-     * shell is drawn with depth-writes off so the world always occludes it.
+     * A huge inward-facing cylinder plus a zenith fan, built once. The sky is
+     * NOT fogged and NOT lit; the panorama is a constant-along-u daylight
+     * gradient, so it wraps seamlessly by construction. Radius 110 sits well
+     * inside the 260 m far plane, and the shell is drawn with depth-writes
+     * off so the world always occludes it.
      *
      * UV mapping (v2 — the fix for the "stretched sky" report):
      *  - u spans exactly 0..1 around the full 360°: the art is a 2:1 equirect
      *    panorama, so one wrap is the only non-distorted choice. The previous
      *    12× repeat mosaic was wrong for this texture.
      *  - v is flipped versus the naive bottom-up read: `GLUtils.texImage2D`
-     *    stores bitmap row 0 (the image TOP, the dark zenith half) at v=0, so
-     *    v=0 is the zenith and v=1 is the image BOTTOM, where the horizon glow
-     *    band lives. The cylinder therefore maps its lower rim to v=1 (y just
-     *    under the eye, so the glow ring peeks over the far walls exactly at
-     *    the horizon line) and its top to v≈0.05; the zenith fan samples the
-     *    clamped v=0 edge, i.e. the darkest part of the photo.
+     *    stores bitmap row 0 (the image TOP, the deep-blue zenith) at v=0, so
+     *    v=0 is the zenith and v=1 is the image BOTTOM, where the pale horizon
+     *    haze band lives. The cylinder therefore maps its lower rim to v=1 (y
+     *    just under the eye, so the haze ring meets the far walls exactly at
+     *    the horizon line — and it is precisely the world fog colour, so the
+     *    blend is invisible); the zenith fan samples the clamped v≈0 edge,
+     *    the flat deep-blue cap.
      *
      * The sun disc and the drifting cloud strata are procedural — they are
      * evaluated in SKY_FS from the look direction (vDir), not baked into this
@@ -263,7 +266,7 @@ class GameRenderer(
         val yTop = 62f
         val yBot = -10f
         val segs = 32
-        // v=1 is the image bottom (the horizon glow), v=0 the dark zenith.
+        // v=1 is the image bottom (the horizon haze), v=0 the blue zenith.
         val vBot = 1.0f
         val vTop = 0.045f
         for (i in 0 until segs) {
@@ -291,8 +294,8 @@ class GameRenderer(
             )
         }
         // Zenith disc: closes the hole at the top of the cylinder. It samples
-        // a hard against the clamped v=0 edge — the darkest, most uniform row
-        // of the zenith half, so the cap is effectively flat with no seams.
+        // hard against the clamped v=0 edge, which the generator left
+        // perfectly flat, so the cap is uniform with no seams.
         for (i in 0 until segs) {
             val a0 = (i * Math.PI * 2 / segs).toFloat()
             val a1 = ((i + 1) * Math.PI * 2 / segs).toFloat()
@@ -400,7 +403,9 @@ class GameRenderer(
         lit.setVec3("uFogColor", FOG_R, FOG_G, FOG_B)
         lit.setFloat("uFogDensity", if (playing) 0.0075f else 0.0045f)
         lit.setVec3("uEye", camera.x, camera.y, camera.z)
-        lit.setFloat("uAmbient", 0.55f)
+        // Midday scattering: the hemisphere term carries most of the light,
+        // the directional sun adds contrast on the lit faces.
+        lit.setFloat("uAmbient", 0.66f)
         lit.setFloat("uTime", timeSec)
         lit.setSampler("uTex", 0)
         lit.setMatrix("uModel", identity)
@@ -661,7 +666,9 @@ class GameRenderer(
             val floorY = shadowRay.y - d + 0.03f
             val fade = (1f - drop / SHADOW_MAX_DROP).coerceIn(0f, 1f)
             if (fade <= 0.02f) continue
-            val alpha = 0.34f * fade + 0.06f
+            // Sunlit contact shadows need more contrast than the old night
+            // ones: a bright floor swallows a faint blob whole.
+            val alpha = 0.40f * fade + 0.07f
             val radius = 0.55f + drop * 0.055f
 
             // Radial fan as triangle soup: centre vertex opaque-ish, rim zero —
@@ -1125,7 +1132,9 @@ class GameRenderer(
                 val blockX = ((x - arena.minX + 0.01f).toInt() / 2)
                 val blockZ = ((z - arena.minZ + 0.01f).toInt() / 2)
                 val dark = ((blockX + blockZ) and 1) == 0
-                val c = if (dark) 0.148f else 0.178f
+                // Daylight palette: a bright concrete checker with a cool
+                // (sky-tinted) B/G lift applied below.
+                val c = if (dark) 0.340f else 0.420f
                 val sh = floorContactShadow((x + x1) * 0.5f, (z + z1) * 0.5f)
                 floorB.floorTile(
                     x, z, x1, z1, 0f,
@@ -1174,9 +1183,9 @@ class GameRenderer(
         val sb = MeshBuilder(withNormals = true, initialCapacity = 2048)
         for (s in arena.spawns) {
             val (r, g, bb) = when (s.team) {
-                Team.RED -> Triple(0.42f, 0.14f, 0.12f)
-                Team.BLUE -> Triple(0.12f, 0.20f, 0.44f)
-                else -> Triple(0.24f, 0.24f, 0.26f)
+                Team.RED -> Triple(0.52f, 0.18f, 0.16f)
+                Team.BLUE -> Triple(0.16f, 0.26f, 0.54f)
+                else -> Triple(0.34f, 0.34f, 0.36f)
             }
             sb.box(
                 s.position.x - 1.1f, 0.001f, s.position.z - 1.1f,
@@ -1228,13 +1237,19 @@ class GameRenderer(
         )
     }
 
+    /**
+     * Daylight albedos: light cool metals with warm wooden crates as the
+     * contrast accent. The texture detail layer multiplies on top exactly as
+     * before — these are simply the old night values re-exposed for a sunlit
+     * arena so the fog tonemap lands in the bright half of its shoulder.
+     */
     private fun materialColour(material: Int): Triple<Float, Float, Float> = when (material) {
-        Material.WALL -> Triple(0.335f, 0.352f, 0.400f)
-        Material.CRATE -> Triple(0.520f, 0.390f, 0.220f)
-        Material.PILLAR -> Triple(0.300f, 0.330f, 0.420f)
-        Material.COVER -> Triple(0.235f, 0.375f, 0.330f)
-        Material.RAMP -> Triple(0.380f, 0.380f, 0.400f)
-        else -> Triple(0.400f, 0.400f, 0.420f)
+        Material.WALL -> Triple(0.585f, 0.605f, 0.655f)
+        Material.CRATE -> Triple(0.660f, 0.520f, 0.320f)
+        Material.PILLAR -> Triple(0.540f, 0.580f, 0.675f)
+        Material.COVER -> Triple(0.460f, 0.590f, 0.545f)
+        Material.RAMP -> Triple(0.600f, 0.600f, 0.630f)
+        else -> Triple(0.600f, 0.600f, 0.630f)
     }
 
     /**
@@ -1347,10 +1362,13 @@ class GameRenderer(
         /** Shadows fade to nothing over this drop (m); also clamps raycasts. */
         private const val SHADOW_MAX_DROP = 5.5f
 
-        // Fog / clear colour: a cool dark blue-grey.
-        private const val FOG_R = 0.055f
-        private const val FOG_G = 0.070f
-        private const val FOG_B = 0.092f
+        // Fog / clear colour: daylight horizon haze, (almost) the same pale
+        // blue the sky panorama fades to at its bottom edge (sky.jpg v=1 ≈
+        // rgb 211/226/244) — matched AFTER the PostFx exposure so distant
+        // geometry dissolves into the sky band instead of a grey wall.
+        private const val FOG_R = 0.780f
+        private const val FOG_G = 0.845f
+        private const val FOG_B = 0.930f
 
         // Key light direction (pointing from the surface toward the light).
         private const val LIGHT_X = 0.38f
@@ -1402,9 +1420,10 @@ class GameRenderer(
             void main() {
                 vec3 n = normalize(vNormal);
                 float lambert = max(dot(n, normalize(uLightDir)), 0.0);
-                // Hemisphere term: sky above, bounce below. Keeps vertical faces
-                // readable without a second light or any shadow mapping.
-                float hemi = 0.55 + 0.45 * n.y;
+                // Hemisphere term: sky above, bounce below. The daylight base
+                // is high (the whole dome is a light source), so vertical
+                // walls stay readable without a second light or shadow maps.
+                float hemi = 0.65 + 0.35 * n.y;
                 float light = uAmbient * hemi + (1.0 - uAmbient) * lambert;
                 // The texture is a greyscale-ish detail layer: uTexGain restores
                 // the palette brightness (1/mean-luma), so the original vertex
@@ -1414,10 +1433,12 @@ class GameRenderer(
                 vec3 c = vColor * detail * uTint * light;
                 // A scanner shimmer sweeping diagonally across the arena floor:
                 // one cool band roughly 12 m wide, reappearing every ~8 s.
+                // Kept gentle so the sunlit checker reads it as a neon accent,
+                // not as a lighting change.
                 if (uSweep > 0.0) {
                     float wave = sin(vWorld.x * 0.42 + vWorld.z * 0.31 - uTime * 1.35);
                     float band = smoothstep(0.72, 0.96, wave) * uSweep;
-                    c += vec3(0.05, 0.10, 0.18) * band * (0.4 + 0.6 * detail.g);
+                    c += vec3(0.04, 0.085, 0.14) * band * (0.4 + 0.6 * detail.g);
                 }
                 if (uEmissive > 0.0) {
                     c += vColor * uEmissive;
@@ -1431,9 +1452,9 @@ class GameRenderer(
 
         /**
          * Sky shell: one textured inward-facing cylinder around the arena, drawn
-         * first with depth writes off. Unlit and unfogged on purpose — fogging
-         * the sky would crush the stars into murk; the fog-tinted world already
-         * blends toward the same dark palette at distance.
+         * first with depth writes off. Unlit and unfogged on purpose — the sky
+         * IS the far background; the fog-tinted world dissolves into the same
+         * haze colour at distance, so the junction stays invisible.
          *
          * vDir carries the eye→fragment ray so the fragment shader can layer
          * procedural elements (sun, clouds) on top of the panorama without
@@ -1461,9 +1482,10 @@ class GameRenderer(
          *    drift across.
          *  - Clouds: cheap 2-octave value noise sampled in wrap-proof polar
          *    coordinates (cos/sin of the azimuth), faded out toward the
-         *    horizon glow and the zenith, scrolled slowly with uTime. They
-         *    are ALPHA'd over the photo, not replacing it, so the star field
-         *    still glints through the gaps — night-sky clouds, not day.
+         *    horizon and the zenith, scrolled slowly with uTime. White
+         *    midday cumulus with a warm rim on the sun side, alpha'd over
+         *    the blue panorama so the haze band keeps breathing through
+         *    their lower edges.
          */
         private const val SKY_FS = """#version 300 es
             precision mediump float;
@@ -1498,7 +1520,7 @@ class GameRenderer(
                 float cloud = 0.0;
                 if (dir.y > 0.01) {
                     float az = atan(dir.z, dir.x);
-                    // Polar ring coordinates rhug the dome and wrap at ±π with
+                    // Polar ring coordinates hug the dome and wrap at ±π with
                     // no seam (cos/sin are periodic); the radius shrinks toward
                     // the zenith so the pattern hits it with zero area, i.e.
                     // no pinwheel artifact. uTime slides the whole ring.
@@ -1509,25 +1531,33 @@ class GameRenderer(
                             + vnoise(cuv * 3.10 + 17.7) * 0.40;
                     float band = smoothstep(0.03, 0.20, dir.y)
                                * (1.0 - smoothstep(0.50, 0.85, dir.y));
-                    cloud = smoothstep(0.52, 0.80, n) * band;
-                    // Cool, dark cloud body with a warm rim on the sun side:
-                    // fits the existing fog palette and the neon horizon.
+                    // Scattered cover, not overcast: with the threshold at
+                    // 0.60+ only the densest noise cells become cumulus and
+                    // most of the blue dome stays visible. (The night value
+                    // 0.50 looked fine on dark clouds; on white ones it
+                    // whitens the entire sky.)
+                    cloud = smoothstep(0.60, 0.85, n) * band;
+                    // White midday body that warms up toward the sun side —
+                    // the silver-lining rim that sells a lit cloud.
                     float sunSide = pow(max(sunDot, 0.0), 3.0);
-                    vec3 cloudCol = vec3(0.11, 0.15, 0.21)
-                                  + vec3(0.40, 0.34, 0.22) * sunSide;
-                    col = mix(col, cloudCol, cloud * 0.72);
+                    vec3 cloudCol = vec3(0.93, 0.95, 1.00)
+                                  + vec3(0.12, 0.06, -0.06) * sunSide;
+                    // Slight grey-blue underside keeps the puffs 3D against
+                    // the pale horizon band.
+                    cloudCol *= 1.0 - vec3(0.16, 0.13, 0.08) * (1.0 - dir.y);
+                    col = mix(col, cloudCol, cloud * 0.80);
                 }
 
                 // ---- sun --------------------------------------------------
                 // Smooth angular falls off from angular thresholds (dot = cos).
                 float disc   = smoothstep(0.99935, 0.99978, sunDot);
-                float corona = pow(max(sunDot, 0.0), 340.0) * 0.85;
-                float halo   = pow(max(sunDot, 0.0), 14.0) * 0.17;
-                // White-hot core, warm halo — stands out against the night
-                // palette without cold-shifting the arena's teal fog accent.
-                vec3 sunCol = vec3(1.00, 0.95, 0.86);
-                vec3 sun = sunCol * (disc * 3.4 + corona + halo);
-                col += sun * (1.0 - cloud * 0.65);
+                float corona = pow(max(sunDot, 0.0), 340.0) * 1.05;
+                float halo   = pow(max(sunDot, 0.0), 14.0) * 0.26;
+                // White-hot core with a wide warm daylight glare — the extra
+                // halo range is what makes the sky read as outdoors.
+                vec3 sunCol = vec3(1.00, 0.96, 0.88);
+                vec3 sun = sunCol * (disc * 3.6 + corona + halo);
+                col += sun * (1.0 - cloud * 0.60);
 
                 fragColor = vec4(col, 1.0);
             }
@@ -1556,9 +1586,10 @@ class GameRenderer(
             in vec3 vColor;
             out vec4 fragColor;
             void main() {
-                // Slightly blue-black so shadows read as ambient occlusion in
-                // the fog scheme rather than as pure soot.
-                fragColor = vec4(0.012, 0.016, 0.030, clamp(vColor.r, 0.0, 1.0));
+                // Daylight shadow = the sky's ambient arriving where the sun
+                // cannot: a mid blue-grey, not soot. On the bright floor this
+                // sits one clearly visible notch below the unshadowed tiles.
+                fragColor = vec4(0.065, 0.090, 0.160, clamp(vColor.r, 0.0, 1.0));
             }
         """
 
